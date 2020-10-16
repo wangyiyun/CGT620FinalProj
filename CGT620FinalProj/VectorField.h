@@ -1,9 +1,11 @@
 #pragma once
-#include <glm/glm.hpp>
+#include "cutil_math.h"
+#include <windows.h>
+#include <GL/glew.h>
+
 class VectorField
 {
 public:
-	unsigned int id;
-	float scale;
-	glm::vec3 dir;
+	float3 pos;
+	float3 vect;
 };

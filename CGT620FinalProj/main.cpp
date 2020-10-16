@@ -22,46 +22,99 @@
 
 #include "include/FreeImage.h"
 #include "imgui/imgui_impl_glut.h"
+#include "InitShader.h"
 
 #include "VectorField.h"
 
 const int width = 640;	// width of the figure
 const int height = 480;	// height of the figure
+const int vf_scale = 8;
+const int dataSize = vf_scale * vf_scale * vf_scale;
 
-// For OpenGL
+// 3D texture
 GLuint pbo = -1;	// pxiel buffer object, place for OpenGL and CUDA to switch data and display the result
 GLuint textureID = -1;	// OpenGL texture to display the result
+struct cudaGraphicsResource* cuda_pbo_resource;	// pointer to the returned object handle
+float3* cuda_pbo_result;		// place for CUDA output
 
-// For CUDA
-struct cudaGraphicsResource* resource;	// pointer to the teturned object handle
-float3* result;	// place for CUDA output
+// Vector field
+GLuint vao = -1;
+GLuint vbo = -1;
+static const std::string vertex_shader("shader_vert.glsl");
+static const std::string fragment_shader("shader_frag.glsl");
+GLuint shader_program = -1;
+
+struct cudaGraphicsResource* cuda_vbo_resource;
+float3* cuda_vbo_result;
+
+// camera
+GLfloat camX, camZ;
+GLfloat radius = 5.0f;
 
 // Implement of this function is in kernel.cu
-extern "C" void launch_kernel(float3*, unsigned int, unsigned int);
+extern "C" void launch_pbo_kernel(float3*, unsigned int, unsigned int);
+extern "C" void launch_vbo_kernel(float3*, unsigned int);
+
+
+// imgui
+bool renderVBO = true;
 
 void draw_gui()
 {
 	ImGui_ImplGlut_NewFrame();
-	ImGui::ShowDemoWindow();
+	//ImGui::ShowDemoWindow();
+	ImGui::Begin("test");
+	ImGui::Checkbox("render VBO", &renderVBO);
+	ImGui::End();
 	ImGui::Render();
 }
 
-// create pixel buffer object in OpenGL
-void createPBO(GLuint* pbo)
+float uniformRand()	//(-1,1)
 {
-	if (pbo)
-	{
-		int num_texels = width * height;
-		int num_values = num_texels * 3;
+	return (rand() / (float)RAND_MAX) * 2.0f - 1.0f;
+}
 
-		int size_tex_data = sizeof(GLfloat) * num_values;
+//void createVBO();
+//void createVAO()
+//{
+//	glGenVertexArrays(1, &vao);
+//	glBindVertexArray(vao);
+//
+//	createVBO();
+//
+//	const GLuint pos_loc = 0;
+//	glEnableVertexAttribArray(pos_loc);
+//	// position attribute
+//	glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 3 * sizeof(GLfloat), (GLvoid*)0);
+//	glEnableVertexAttribArray(0);
+//
+//	glBindVertexArray(0);
+//}
 
-		glGenBuffers(1, pbo);
-		glBindBuffer(GL_PIXEL_UNPACK_BUFFER, *pbo);
-		glBufferData(GL_PIXEL_UNPACK_BUFFER, size_tex_data, NULL, GL_DYNAMIC_COPY);
+void createVBO()
+{
+	glGenBuffers(1, &vbo);
+	glBindBuffer(GL_ARRAY_BUFFER, vbo);
+	//glBufferData(GL_ARRAY_BUFFER, sizeof(float3) * dataSize * 2, vfData, GL_DYNAMIC_DRAW);
+	glBufferData(GL_ARRAY_BUFFER, sizeof(float3) * dataSize * 2, 0, GL_DYNAMIC_DRAW);
+	glBindBuffer(GL_ARRAY_BUFFER, 0);
 
-		cudaGraphicsGLRegisterBuffer(&resource, *pbo, cudaGraphicsMapFlagsWriteDiscard);
-	}
+	cudaGraphicsGLRegisterBuffer(&cuda_vbo_resource, vbo, cudaGraphicsMapFlagsWriteDiscard);
+}
+
+// create pixel buffer object in OpenGL
+void createPBO()
+{
+	int num_texels = width * height;
+	int num_values = num_texels * 3;
+
+	int size_tex_data = sizeof(GLfloat) * num_values;
+
+	glGenBuffers(1, &pbo);
+	glBindBuffer(GL_PIXEL_UNPACK_BUFFER, pbo);
+	glBufferData(GL_PIXEL_UNPACK_BUFFER, size_tex_data, NULL, GL_DYNAMIC_COPY);
+
+	cudaGraphicsGLRegisterBuffer(&cuda_pbo_resource, pbo, cudaGraphicsMapFlagsWriteDiscard);
 }
 
 // create texture in OpenGL
@@ -81,7 +134,8 @@ void createTexture(GLuint* textureID, unsigned int size_x, unsigned int size_y)
 
 void initCuda()
 {
-	createPBO(&pbo);
+	createVBO();
+	createPBO();
 	createTexture(&textureID, width, height);
 }
 
@@ -89,12 +143,21 @@ void runCuda()
 {
 	size_t num_bytes;
 
-	cudaGraphicsMapResources(1, &resource, 0);
-	cudaGraphicsResourceGetMappedPointer((void**)& result, &num_bytes, resource);
+	// update vector field kernel
+	cudaGraphicsMapResources(1, &cuda_vbo_resource, 0);
+	cudaGraphicsResourceGetMappedPointer((void**)& cuda_vbo_result, &num_bytes, cuda_vbo_resource);
 
-	launch_kernel(result, width, height);
+	launch_vbo_kernel(cuda_vbo_result, vf_scale);
 
-	cudaGraphicsUnmapResources(1, &resource, 0);
+	cudaGraphicsUnmapResources(1, &cuda_vbo_resource, 0);
+
+	// render 3D texture kernel
+	cudaGraphicsMapResources(1, &cuda_pbo_resource, 0);
+	cudaGraphicsResourceGetMappedPointer((void**)& cuda_pbo_result, &num_bytes, cuda_pbo_resource);
+
+	launch_pbo_kernel(cuda_pbo_result, width, height);
+
+	cudaGraphicsUnmapResources(1, &cuda_pbo_resource, 0);
 }
 
 void display()
@@ -102,10 +165,39 @@ void display()
 
 }
 
-void idle()
+void drawVertexField()
 {
 	glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
-	runCuda();
+	glUseProgram(shader_program);
+	const int w = glutGet(GLUT_WINDOW_WIDTH);
+	const int h = glutGet(GLUT_WINDOW_HEIGHT);
+	const float aspect_ratio = float(w) / float(h);
+
+	
+	camX = sin(glutGet(GLUT_ELAPSED_TIME)*0.002f) * radius;
+	camZ = cos(glutGet(GLUT_ELAPSED_TIME)*0.002f) * radius;
+
+	glm::mat4 V = glm::lookAt(glm::vec3(camX, 0.0f, camZ), glm::vec3(0.0f, 0.0f, 0.0f), glm::vec3(0.0f, 1.0f, 0.0f));
+	glm::mat4 P = glm::perspective(3.141592f / 4.0f, aspect_ratio, 0.1f, 100.0f);
+
+	const int PV_loc = 0;
+	glm::mat4 PV = P * V;
+	glUniformMatrix4fv(PV_loc, 1, false, glm::value_ptr(PV));
+
+	glBindBuffer(GL_ARRAY_BUFFER, vbo);
+	glVertexPointer(3, GL_FLOAT, 0, 0);
+
+	glEnableClientState(GL_VERTEX_ARRAY);
+	glDrawArrays(GL_LINES, 0, dataSize * 2);
+	glDisableClientState(GL_VERTEX_ARRAY);
+
+	glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);	// in case for imgui's bug
+}
+
+void drawPBO()
+{
+	glUseProgram(0);
+	glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
 	glBindBuffer(GL_PIXEL_UNPACK_BUFFER, pbo);
 
 	glBindTexture(GL_TEXTURE_2D, textureID);
@@ -122,6 +214,16 @@ void idle()
 	glEnd();
 	// unbind
 	glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
+}
+
+void idle()
+{
+	
+	runCuda();
+	
+	if(renderVBO) drawVertexField();
+	else drawPBO();
+
 	draw_gui();
 
 	glutSwapBuffers();
@@ -143,6 +245,27 @@ void printGlInfo()
 	std::cout << "Max Compute Work Group Invocations: " << total << std::endl;
 }
 
+void reload_shader()
+{
+	GLuint new_shader = InitShader(vertex_shader.c_str(), fragment_shader.c_str());
+
+	if (new_shader == -1) // loading failed
+	{
+		glClearColor(1.0f, 0.0f, 1.0f, 0.0f);
+	}
+	else
+	{
+		glClearColor(0.35f, 0.35f, 0.35f, 0.0f);
+
+		if (shader_program != -1)
+		{
+			glDeleteProgram(shader_program);
+		}
+		shader_program = new_shader;
+
+	}
+}
+
 void initOpenGl()
 {
 	//Initialize glew so that new OpenGL function names can be used
@@ -157,7 +280,9 @@ void initOpenGl()
 	glLoadIdentity();
 
 	glEnable(GL_DEPTH_TEST);
-	glClearColor(0.2, 0.2, 0.2, 1.0);
+
+	reload_shader();
+
 	glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
 }
 
@@ -228,7 +353,8 @@ int main(int argc, char** argv)
 	glutDestroyWindow(win);
 
 	// free buffer before close
-	cudaFree(result);
+	cudaFree(cuda_pbo_result);
+	cudaFree(cuda_vbo_result);
 
 	ImGui_ImplGlut_Shutdown();
 
