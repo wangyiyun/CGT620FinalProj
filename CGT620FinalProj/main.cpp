@@ -1,3 +1,4 @@
+// refer to CUDA example: volumeRender
 #include <stdio.h>
 #include <windows.h>
 // OpenGL
@@ -26,16 +27,20 @@
 
 #include "VectorField.h"
 
-const int width = 640;	// width of the figure
-const int height = 480;	// height of the figure
+const int width = 512;	// width of the figure
+const int height = 512;	// height of the figure
 const int vf_scale = 8;
+const float vf_step = 1.0f / vf_scale;
 const int dataSize = vf_scale * vf_scale * vf_scale;
 
-// 3D texture
+// 3D texture rendering
 GLuint pbo = -1;	// pxiel buffer object, place for OpenGL and CUDA to switch data and display the result
 GLuint textureID = -1;	// OpenGL texture to display the result
 struct cudaGraphicsResource* cuda_pbo_resource;	// pointer to the returned object handle
 float3* cuda_pbo_result;		// place for CUDA output
+// 3D texture data
+const char* volumeFilename = "data/Bucky.raw";
+cudaExtent volumeSize = make_cudaExtent(32, 32, 32);
 
 // Vector field
 GLuint vao = -1;
@@ -50,10 +55,14 @@ float3* cuda_vbo_result;
 // camera
 GLfloat camX, camZ;
 GLfloat radius = 5.0f;
+float3 viewRotation;
+float3 viewTranslation = make_float3(0.0, 0.0, -5.0f);
+float invViewMatrix[12];
 
 // Implement of this function is in kernel.cu
-extern "C" void launch_pbo_kernel(float3*, unsigned int, unsigned int);
-extern "C" void launch_vbo_kernel(float3*, unsigned int);
+extern "C" void launch_pbo_kernel(float3* cuda_pbo_result, unsigned int width, unsigned int height);
+extern "C" void launch_vbo_kernel(float3* cuda_vbo_result, unsigned int vf_scale);
+extern "C" void copyInvViewMatrix(float* invViewMatrix, size_t sizeofMatrix);
 
 
 // imgui
@@ -152,8 +161,11 @@ void runCuda()
 	cudaGraphicsUnmapResources(1, &cuda_vbo_resource, 0);
 
 	// render 3D texture kernel
+	
 	cudaGraphicsMapResources(1, &cuda_pbo_resource, 0);
 	cudaGraphicsResourceGetMappedPointer((void**)& cuda_pbo_result, &num_bytes, cuda_pbo_resource);
+
+	cudaMemset(cuda_pbo_result, 0, width * height * 3);
 
 	launch_pbo_kernel(cuda_pbo_result, width, height);
 
@@ -165,6 +177,43 @@ void display()
 
 }
 
+
+GLfloat modelView[16] =
+{
+	1.0f, 0.0f, 0.0f, 0.0f,
+	0.0f, 1.0f, 0.0f, 0.0f,
+	0.0f, 0.0f, 1.0f, 0.0f,
+	0.0f, 0.0f, 4.0f, 1.0f
+};
+
+void updateCamera()
+{
+	// use OpenGL to build view matrix
+	glMatrixMode(GL_MODELVIEW);
+	glPushMatrix();
+	glLoadIdentity();
+	glRotatef(-viewRotation.x, 1.0, 0.0, 0.0);
+	glRotatef(-viewRotation.y, 0.0, 1.0, 0.0);
+	glTranslatef(-viewTranslation.x, -viewTranslation.y, -viewTranslation.z);
+	glGetFloatv(GL_MODELVIEW_MATRIX, modelView);
+	glPopMatrix();
+
+	invViewMatrix[0] = modelView[0];
+	invViewMatrix[1] = modelView[4];
+	invViewMatrix[2] = modelView[8];
+	invViewMatrix[3] = modelView[12];
+	invViewMatrix[4] = modelView[1];
+	invViewMatrix[5] = modelView[5];
+	invViewMatrix[6] = modelView[9];
+	invViewMatrix[7] = modelView[13];
+	invViewMatrix[8] = modelView[2];
+	invViewMatrix[9] = modelView[6];
+	invViewMatrix[10] = modelView[10];
+	invViewMatrix[11] = modelView[14];
+
+	copyInvViewMatrix(invViewMatrix, sizeof(float4) * 3);
+}
+
 void drawVertexField()
 {
 	glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
@@ -173,16 +222,24 @@ void drawVertexField()
 	const int h = glutGet(GLUT_WINDOW_HEIGHT);
 	const float aspect_ratio = float(w) / float(h);
 
-	
-	camX = sin(glutGet(GLUT_ELAPSED_TIME)*0.002f) * radius;
-	camZ = cos(glutGet(GLUT_ELAPSED_TIME)*0.002f) * radius;
+	//camX = sin(glutGet(GLUT_ELAPSED_TIME)*0.002f) * radius;
+	//camZ = cos(glutGet(GLUT_ELAPSED_TIME)*0.002f) * radius;
 
-	glm::mat4 V = glm::lookAt(glm::vec3(camX, 0.0f, camZ), glm::vec3(0.0f, 0.0f, 0.0f), glm::vec3(0.0f, 1.0f, 0.0f));
+	//glm::vec3 dir;
+	//dir.x = cos(glm::radians(viewRotation.x))* cos(glm::radians(viewRotation.y));
+	//dir.y = sin(glm::radians(viewRotation.y));
+	//dir.x = sin(glm::radians(viewRotation.x)) * cos(glm::radians(viewRotation.y));
+	//dir = glm::normalize(dir);
+
+	glm::mat4 trans = glm::mat4(1.0f);
+	glm::mat4 M = glm::rotate(trans, glm::radians(viewRotation.x), glm::vec3(-1.0f, 0.0f, 0.0f))
+		* glm::rotate(trans, glm::radians(viewRotation.y), glm::vec3(0.0f, 1.0f, 0.0f));
+	glm::mat4 V = glm::lookAt(glm::vec3(0.0f, 0.0f, viewTranslation.z), glm::vec3(0.0f, 0.0f, 0.0f), glm::vec3(0.0f, 1.0f, 0.0f));
 	glm::mat4 P = glm::perspective(3.141592f / 4.0f, aspect_ratio, 0.1f, 100.0f);
 
-	const int PV_loc = 0;
-	glm::mat4 PV = P * V;
-	glUniformMatrix4fv(PV_loc, 1, false, glm::value_ptr(PV));
+	const int PVM_loc = 0;
+	glm::mat4 PVM = P * V * M;
+	glUniformMatrix4fv(PVM_loc, 1, false, glm::value_ptr(PVM));
 
 	glBindBuffer(GL_ARRAY_BUFFER, vbo);
 	glVertexPointer(3, GL_FLOAT, 0, 0);
@@ -218,7 +275,10 @@ void drawPBO()
 
 void idle()
 {
-	
+	glutPostRedisplay();
+
+	updateCamera();
+
 	runCuda();
 	
 	if(renderVBO) drawVertexField();
@@ -312,14 +372,56 @@ void special(int key, int x, int y)
 	ImGui_ImplGlut_SpecialCallback(key);
 }
 
-void motion(int x, int y)
-{
-	ImGui_ImplGlut_MouseMotionCallback(x, y);
-}
+int ox, oy;
+int buttonState = 0;
 
 void mouse(int button, int state, int x, int y)
 {
 	ImGui_ImplGlut_MouseButtonCallback(button, state);
+	//std::cout << x << " " << y << std::endl;
+	if (state == GLUT_DOWN)
+	{
+		buttonState |= 1 << button;
+	}
+	else if (state == GLUT_UP)
+	{
+		buttonState = 0;
+	}
+
+	ox = x;
+	oy = y;
+	glutPostRedisplay();
+
+}
+
+void motion(int x, int y)
+{
+	ImGui_ImplGlut_MouseMotionCallback(x, y);
+	float dx, dy;
+	dx = (float)(x - ox);
+	dy = (float)(y - oy);
+
+	if (buttonState == 4)
+	{
+		// right = zoom
+		viewTranslation.z += dy / 100.0f;
+	}
+	else if (buttonState == 2)
+	{
+		// middle = translate
+		viewTranslation.x += dx / 100.0f;
+		viewTranslation.y -= dy / 100.0f;
+	}
+	else if (buttonState == 1)
+	{
+		// left = rotate
+		viewRotation.x += dy / 5.0f;
+		viewRotation.y += dx / 5.0f;
+	}
+
+	ox = x;
+	oy = y;
+	glutPostRedisplay();
 }
 
 int main(int argc, char** argv)
