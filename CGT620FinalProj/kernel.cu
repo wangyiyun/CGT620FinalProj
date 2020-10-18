@@ -12,6 +12,12 @@ using namespace std;
 #include <curand.h>
 #include <curand_kernel.h>
 
+typedef unsigned char VolumeType;
+cudaArray* d_volumeArray = 0;	// 3D texture Data
+cudaTextureObject_t	volumeTexObject; // 3D texture Object
+cudaArray* d_transferFuncArray;
+cudaTextureObject_t	transferTexObject; // Transfer texture Object
+
 void checkCudaError(const char* msg)
 {
 	cudaError_t err = cudaGetLastError();
@@ -81,7 +87,84 @@ __device__ float4 mul(const float3x4& M, const float4& v)
 	return r;
 }
 
-__global__ void render(float3* result, unsigned int width, unsigned int height)
+extern "C" void copyVolumeTextures(void* h_volume, cudaExtent volumeSize)
+{
+	// create 3D array
+	cudaChannelFormatDesc channelDesc = cudaCreateChannelDesc<VolumeType>();
+	cudaMalloc3DArray(&d_volumeArray, &channelDesc, volumeSize);
+	checkCudaError("Cuda malloc 3D array failed!");
+
+	// copy data to 3D array
+	cudaMemcpy3DParms copyParams = { 0 };
+	copyParams.srcPtr = make_cudaPitchedPtr(h_volume, volumeSize.width * sizeof(VolumeType), volumeSize.width, volumeSize.height);
+	copyParams.dstArray = d_volumeArray;
+	copyParams.extent = volumeSize;
+	copyParams.kind = cudaMemcpyHostToDevice;
+	cudaMemcpy3D(&copyParams);
+	checkCudaError("Cuda memcpy 3D array failed!");
+
+	cudaResourceDesc            texRes;
+	memset(&texRes, 0, sizeof(cudaResourceDesc));
+
+	texRes.resType = cudaResourceTypeArray;
+	texRes.res.array.array = d_volumeArray;
+
+	cudaTextureDesc             texDescr;
+	memset(&texDescr, 0, sizeof(cudaTextureDesc));
+
+	texDescr.normalizedCoords = true; // access with normalized texture coordinates
+	texDescr.filterMode = cudaFilterModeLinear; // linear interpolation
+
+	texDescr.addressMode[0] = cudaAddressModeClamp;  // clamp texture coordinates
+	texDescr.addressMode[1] = cudaAddressModeClamp;
+	texDescr.addressMode[2] = cudaAddressModeClamp;
+
+	texDescr.readMode = cudaReadModeNormalizedFloat;
+
+	cudaCreateTextureObject(&volumeTexObject, &texRes, &texDescr, NULL);
+	checkCudaError("Cuda create volume texture object failed!");
+
+	// create transfer function texture
+	float4 transferFunc[] =
+	{
+		{  0.0, 0.0, 0.0, 0.0, },
+		{  1.0, 0.0, 0.0, 1.0, },
+		{  1.0, 0.5, 0.0, 1.0, },
+		{  1.0, 1.0, 0.0, 1.0, },
+		{  0.0, 1.0, 0.0, 1.0, },
+		{  0.0, 1.0, 1.0, 1.0, },
+		{  0.0, 0.0, 1.0, 1.0, },
+		{  1.0, 0.0, 1.0, 1.0, },
+		{  0.0, 0.0, 0.0, 0.0, },
+	};
+
+	cudaChannelFormatDesc channelDesc2 = cudaCreateChannelDesc<float4>();
+	cudaArray* d_transferFuncArray;
+	cudaMallocArray(&d_transferFuncArray, &channelDesc2, sizeof(transferFunc) / sizeof(float4), 1);
+	checkCudaError("Cuda malloc transfer texture failed!");
+	cudaMemcpyToArray(d_transferFuncArray, 0, 0, transferFunc, sizeof(transferFunc), cudaMemcpyHostToDevice);
+	checkCudaError("Cuda memcpy transfer texture failed!");
+
+	memset(&texRes, 0, sizeof(cudaResourceDesc));
+
+	texRes.resType = cudaResourceTypeArray;
+	texRes.res.array.array = d_transferFuncArray;
+
+	memset(&texDescr, 0, sizeof(cudaTextureDesc));
+
+	texDescr.normalizedCoords = true; // access with normalized texture coordinates
+	texDescr.filterMode = cudaFilterModeLinear;
+
+	texDescr.addressMode[0] = cudaAddressModeClamp; // wrap texture coordinates
+
+	texDescr.readMode = cudaReadModeElementType;
+
+	cudaCreateTextureObject(&transferTexObject, &texRes, &texDescr, NULL);
+	checkCudaError("Cuda create transfer texture failed!");
+}
+
+__global__ void render_3D_texture(float3* result, unsigned int width, unsigned int height, cudaTextureObject_t volumeTex,
+	cudaTextureObject_t transferTex)
 {
 	int i = threadIdx.x + blockIdx.x * blockDim.x;
 	int j = threadIdx.y + blockIdx.y * blockDim.y;
@@ -95,22 +178,58 @@ __global__ void render(float3* result, unsigned int width, unsigned int height)
 	float u = (i / (float)width) * 2.0f - 1.0f;
 	float v = (j / (float)height) * 2.0f - 1.0f;
 
-	// calculate eye ray in world space
+	// ray marching parameters
+	const int maxSteps = 500;
+	const float tStep = 0.01f;
+	const float opacityThreshold = 0.95f;
+	const float density = 0.04f;
+	const float transferOffset = 0.0f;
+	const float transferScale = 1.0f;
+	// calculate camera ray in world space
 	Ray ray;
 	ray.origin = make_float3(mul(c_invViewMatrix, make_float4(0.0f, 0.0f, 0.0f, 1.0f)));
 	ray.dir = normalize(make_float3(u, -v, -2.0f));
 	ray.dir = mul(c_invViewMatrix, ray.dir);
 
 	// background color
-	result[index] = ray.dir;
+	result[index] = make_float3(0.0f);
 
 	// intersect with AABB
-	float tnear, tfar;
-	bool hit = intersectAABB(ray, boxMin, boxMax, &tnear, &tfar);
+	float tNear, tFar;
+	bool hit = intersectAABB(ray, boxMin, boxMax, &tNear, &tFar);
 
-	if(hit) result[index] = make_float3(1.0f);
+	if (!hit) return;
 
+	// ray marching
+	float4 sum = make_float4(0.0f);
+	float t = tNear;
+	float3 pos = ray.origin + ray.dir * t;
+	float3 step = ray.dir * tStep;
+
+
+	for (int i = 0; i < maxSteps; i++)
+	{
+		// read from 3D texture
+		// remap position to [0, 1] coordinates
+		float sample = tex3D<float>(volumeTex, pos.x * 0.5f + 0.5f, pos.y * 0.5f + 0.5f, pos.z * 0.5f + 0.5f);
+		float4 color = tex1D<float4>(transferTex, (sample - transferOffset) * transferScale);
+		color.w *= density;
+		
+		color.x *= color.w;
+		color.y *= color.w;
+		color.z *= color.w;
+
+		sum += color * (1.0f - sum.w);
+
+		if (sum.w > opacityThreshold) break;
+
+		t += tStep;
+		if (t > tFar) break;
+
+		pos += step;
+	}
 	
+	result[index] = make_float3(sum.x, sum.y, sum.z);
 	//if (c_invViewMatrix.m[0].x == 1.0f) result[index] = make_float3(0.0f, 0.0f, 1.0f);
 	return;
 }
@@ -123,13 +242,13 @@ extern "C" void launch_pbo_kernel(float3* result, unsigned int width, unsigned i
 	dim3 blocks(width / tx + 1, height / ty + 1);
 	dim3 threads(tx, ty);
 
-	render << <blocks, threads >> > (result, width, height);
+	render_3D_texture << <blocks, threads >> > (result, width, height, volumeTexObject, transferTexObject);
 
 	checkCudaError("pbo kernel failed!");
 }
 
 
-__global__ void update(float3* pos, unsigned int N)
+__global__ void update_vector_field(float3* pos, unsigned int N)
 {
 	unsigned int x = blockIdx.x * blockDim.x + threadIdx.x;
 	unsigned int y = blockIdx.y * blockDim.y + threadIdx.y;
@@ -156,9 +275,21 @@ extern "C" void launch_vbo_kernel(float3* pos, unsigned int N)
 	dim3 block(4, 4, 4);
 	dim3 grid(N / block.x, N / block.y, N / block.z);
 
-	update << <grid, block >> > (pos, N);
+	update_vector_field << <grid, block >> > (pos, N);
 
 	checkCudaError("vbo kernel failed!");
 
 	cudaThreadSynchronize();
+}
+
+extern "C" void freeCudaBuffers()
+{
+	cudaDestroyTextureObject(volumeTexObject);
+	checkCudaError("Destroy texture object failed!");
+	cudaFreeArray(d_volumeArray);
+	checkCudaError("Free volume array failed!");
+	cudaDestroyTextureObject(transferTexObject);
+	checkCudaError("Destroy texture object failed!");
+	cudaFreeArray(d_transferFuncArray);
+	checkCudaError("Free volume array failed!");
 }

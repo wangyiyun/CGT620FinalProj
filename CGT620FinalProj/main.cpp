@@ -39,8 +39,10 @@ GLuint textureID = -1;	// OpenGL texture to display the result
 struct cudaGraphicsResource* cuda_pbo_resource;	// pointer to the returned object handle
 float3* cuda_pbo_result;		// place for CUDA output
 // 3D texture data
-const char* volumeFilename = "data/Bucky.raw";
-cudaExtent volumeSize = make_cudaExtent(32, 32, 32);
+const char* volumeFileName = "data/Bucky.raw";
+cudaExtent volumeScale = make_cudaExtent(32, 32, 32);
+typedef unsigned char VolumeType;
+
 
 // Vector field
 GLuint vao = -1;
@@ -63,6 +65,7 @@ float invViewMatrix[12];
 extern "C" void launch_pbo_kernel(float3* cuda_pbo_result, unsigned int width, unsigned int height);
 extern "C" void launch_vbo_kernel(float3* cuda_vbo_result, unsigned int vf_scale);
 extern "C" void copyInvViewMatrix(float* invViewMatrix, size_t sizeofMatrix);
+extern "C" void copyVolumeTextures(void* h_volume, cudaExtent volumeScale);
 
 
 // imgui
@@ -141,11 +144,35 @@ void createTexture(GLuint* textureID, unsigned int size_x, unsigned int size_y)
 	glBindTexture(GL_TEXTURE_2D, 0);
 }
 
-void initCuda()
+void setBuffers()
 {
 	createVBO();
 	createPBO();
 	createTexture(&textureID, width, height);
+}
+
+void setVolumeTextures()
+{
+	size_t volumeDataSize = volumeScale.width * volumeScale.height * volumeScale.depth * sizeof(VolumeType);
+	FILE* fp = fopen(volumeFileName, "rb");
+	if (!fp)
+	{
+		fprintf(stderr, "Error opening file '%s'\n", volumeFileName);
+		return;
+	}
+	void* h_volume = malloc(volumeDataSize);
+	if (h_volume)
+	{
+		size_t read = fread(h_volume, 1, volumeDataSize, fp);
+		printf("Read '%s', %zu bytes\n", volumeFileName, read);
+	}
+	else printf("Malloc '%s' failed!\n", volumeFileName);
+	
+	copyVolumeTextures(h_volume, volumeScale);
+	
+	free(h_volume);
+
+	return;
 }
 
 void runCuda()
@@ -446,9 +473,14 @@ int main(int argc, char** argv)
 	glutIdleFunc(idle);
 
 	initOpenGl();
-	initCuda();
 	printGlInfo();
-	ImGui_ImplGlut_Init();	// initialize the imgui system
+	// initialize the imgui system
+	ImGui_ImplGlut_Init();	
+
+	// buffers setup
+	setBuffers();	// vbo, pbo
+	setVolumeTextures();
+
 	//Enter the glut event loop.
 	glutMainLoop();
 	cudaThreadExit();
