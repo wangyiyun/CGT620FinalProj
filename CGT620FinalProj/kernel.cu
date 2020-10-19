@@ -14,11 +14,11 @@ using namespace std;
 
 typedef unsigned char VolumeType;
 cudaArray* d_volumeArray = 0;	// 3D texture Data
-cudaTextureObject_t	volumeTexObject; // 3D texture Object
+cudaTextureObject_t volumeTexObject; // 3D texture Object
 cudaArray* d_transferFuncArray;
-cudaTextureObject_t	transferTexObject; // Transfer texture Object
+cudaTextureObject_t transferTexObject; // Transfer texture Object
 
-void checkCudaError(const char* msg)
+extern "C" void checkCudaError(const char* msg)
 {
 	cudaError_t err = cudaGetLastError();
 
@@ -36,8 +36,7 @@ typedef struct
 
 __constant__ float3x4 c_invViewMatrix;  // inverse view matrix
 
-extern "C"
-void copyInvViewMatrix(float* invViewMatrix, size_t sizeofMatrix)
+extern "C" void copyInvViewMatrix(float* invViewMatrix, size_t sizeofMatrix)
 {
 	cudaMemcpyToSymbol(c_invViewMatrix, invViewMatrix, sizeofMatrix);
 	checkCudaError("Constant memcpy failed!");
@@ -164,7 +163,8 @@ extern "C" void copyVolumeTextures(void* h_volume, cudaExtent volumeSize)
 }
 
 __global__ void render_3D_texture(float3* result, unsigned int width, unsigned int height, cudaTextureObject_t volumeTex,
-	cudaTextureObject_t transferTex)
+	cudaTextureObject_t transferTex,
+	float density, float transferOffset, float transferScale)
 {
 	int i = threadIdx.x + blockIdx.x * blockDim.x;
 	int j = threadIdx.y + blockIdx.y * blockDim.y;
@@ -182,9 +182,7 @@ __global__ void render_3D_texture(float3* result, unsigned int width, unsigned i
 	const int maxSteps = 500;
 	const float tStep = 0.01f;
 	const float opacityThreshold = 0.95f;
-	const float density = 0.04f;
-	const float transferOffset = 0.0f;
-	const float transferScale = 1.0f;
+
 	// calculate camera ray in world space
 	Ray ray;
 	ray.origin = make_float3(mul(c_invViewMatrix, make_float4(0.0f, 0.0f, 0.0f, 1.0f)));
@@ -234,7 +232,8 @@ __global__ void render_3D_texture(float3* result, unsigned int width, unsigned i
 	return;
 }
 
-extern "C" void launch_pbo_kernel(float3* result, unsigned int width, unsigned int height)
+extern "C" void launch_pbo_kernel(float3* result, unsigned int width, unsigned int height,
+	float density, float transferOffset, float transferScale)
 {
 	int tx = 8;
 	int ty = 8;
@@ -242,17 +241,20 @@ extern "C" void launch_pbo_kernel(float3* result, unsigned int width, unsigned i
 	dim3 blocks(width / tx + 1, height / ty + 1);
 	dim3 threads(tx, ty);
 
-	render_3D_texture << <blocks, threads >> > (result, width, height, volumeTexObject, transferTexObject);
+	render_3D_texture << <blocks, threads >> > (result, width, height, volumeTexObject, transferTexObject, 
+		density, transferOffset, transferScale);
 
 	checkCudaError("pbo kernel failed!");
 }
 
-
-__global__ void update_vector_field(float3* pos, unsigned int N)
+__global__ void update_vector_field(float3* pos, unsigned int N, unsigned int currentPickedIndex, float3* inputVF,
+	float3 previewVect, cudaTextureObject_t transferTex)
 {
 	unsigned int x = blockIdx.x * blockDim.x + threadIdx.x;
 	unsigned int y = blockIdx.y * blockDim.y + threadIdx.y;
 	unsigned int z = blockIdx.z * blockDim.z + threadIdx.z;
+
+	if (x >= N || y >= N || z >= N) return;
 
 	float u = x / (float)N;
 	float v = y / (float)N;
@@ -262,20 +264,35 @@ __global__ void update_vector_field(float3* pos, unsigned int N)
 	v = v * 2.0f - 1.0f;
 	w = w * 2.0f - 1.0f;
 
+	float halfStep = 0.5f / N;
+	float3 testVect = make_float3(halfStep);
+
 	unsigned int index = x * N * N + y * N + z;
-	// vert start
-	pos[2 * index] = make_float3(u, v, w);
-	float step = 2.0f / N;
-	// vert end
-	pos[2 * index + 1] = pos[2 * index] + make_float3(0.0f, step, 0.0f);
+	float len = length(inputVF[index]);
+	float3 dir = normalize(inputVF[index]);
+		
+	//float4 color = tex1D<float4>(transferTex, len-0.1f);
+
+	pos[4 * index] = make_float3(u, v, w);// vert start pos
+	pos[4 * index + 1] = dir * 0.5f + 0.5f;
+	pos[4 * index + 2] = make_float3(u, v, w) + make_float3(0.01f) + inputVF[index] * 0.1f;	// vert end pos
+	pos[4 * index + 3] = dir * 0.5f + 0.5f;
+
+	if (index == currentPickedIndex)
+	{
+		pos[4 * index + 2] = make_float3(u, v, w) + make_float3(0.01f) + previewVect * 0.1f;
+		pos[4 * index + 1] = make_float3(1.0f, 1.0f, 0.0f);
+		pos[4 * index + 3] = make_float3(1.0f, 1.0f, 0.0f);
+	}
 }
 
-extern "C" void launch_vbo_kernel(float3* pos, unsigned int N)
+extern "C" void launch_vbo_kernel(float3* pos, unsigned int N, unsigned int currentPickedIndex, 
+	float3* inputVF, float3 previewVect)
 {
 	dim3 block(4, 4, 4);
 	dim3 grid(N / block.x, N / block.y, N / block.z);
 
-	update_vector_field << <grid, block >> > (pos, N);
+	update_vector_field << <grid, block >> > (pos, N, currentPickedIndex, inputVF, previewVect, transferTexObject);
 
 	checkCudaError("vbo kernel failed!");
 
