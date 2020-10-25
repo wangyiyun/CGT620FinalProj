@@ -164,7 +164,7 @@ extern "C" void copyVolumeTextures(void* h_volume, cudaExtent volumeSize)
 
 __global__ void render_3D_texture(float3* result, unsigned int width, unsigned int height, cudaTextureObject_t volumeTex,
 	cudaTextureObject_t transferTex,
-	float density, float transferOffset, float transferScale)
+	float density, float transferOffset, float transferScale, float3* VF, unsigned int N)
 {
 	int i = threadIdx.x + blockIdx.x * blockDim.x;
 	int j = threadIdx.y + blockIdx.y * blockDim.y;
@@ -209,7 +209,15 @@ __global__ void render_3D_texture(float3* result, unsigned int width, unsigned i
 	{
 		// read from 3D texture
 		// remap position to [0, 1] coordinates
-		float sample = tex3D<float>(volumeTex, pos.x * 0.5f + 0.5f, pos.y * 0.5f + 0.5f, pos.z * 0.5f + 0.5f);
+		float3 rePos = pos * 0.5f + 0.5f;
+		unsigned int x = floor(rePos.x) * N;
+		unsigned int y = floor(rePos.y) * N;
+		unsigned int z = floor(rePos.z) * N;
+		unsigned int index = x * N * N + y * N + z;
+
+		rePos -= VF[index] * 0.05f;
+
+		float sample = tex3D<float>(volumeTex, rePos.x, rePos.y, rePos.z);
 		float4 color = tex1D<float4>(transferTex, (sample - transferOffset) * transferScale);
 		color.w *= density;
 		
@@ -233,7 +241,7 @@ __global__ void render_3D_texture(float3* result, unsigned int width, unsigned i
 }
 
 extern "C" void launch_pbo_kernel(float3* result, unsigned int width, unsigned int height,
-	float density, float transferOffset, float transferScale)
+	float density, float transferOffset, float transferScale, float3* VF, unsigned int N)
 {
 	int tx = 8;
 	int ty = 8;
@@ -242,13 +250,13 @@ extern "C" void launch_pbo_kernel(float3* result, unsigned int width, unsigned i
 	dim3 threads(tx, ty);
 
 	render_3D_texture << <blocks, threads >> > (result, width, height, volumeTexObject, transferTexObject, 
-		density, transferOffset, transferScale);
+		density, transferOffset, transferScale, VF, N);
 
 	checkCudaError("pbo kernel failed!");
 }
 
 __global__ void update_vector_field(float3* pos, unsigned int N, unsigned int currentPickedIndex, float3* inputVF,
-	float3 previewVect, cudaTextureObject_t transferTex)
+	float3 previewVect, cudaTextureObject_t transferTex, float time)
 {
 	unsigned int x = blockIdx.x * blockDim.x + threadIdx.x;
 	unsigned int y = blockIdx.y * blockDim.y + threadIdx.y;
@@ -268,11 +276,17 @@ __global__ void update_vector_field(float3* pos, unsigned int N, unsigned int cu
 	float3 testVect = make_float3(halfStep);
 
 	unsigned int index = x * N * N + y * N + z;
-	float len = length(inputVF[index]);
-	float3 dir = normalize(inputVF[index]);
+	//float len = length(inputVF[index]);
+	
 		
 	//float4 color = tex1D<float4>(transferTex, len-0.1f);
 
+	// Vector Field animate
+	inputVF[index] += make_float3(sin(x / 4.0f + time),
+								cos(y / 4.0f), 
+								sin(z / 4.0f + time));
+
+	float3 dir = normalize(inputVF[index]);
 	pos[4 * index] = make_float3(u, v, w);// vert start pos
 	pos[4 * index + 1] = dir * 0.5f + 0.5f;
 	pos[4 * index + 2] = make_float3(u, v, w) + make_float3(0.01f) + inputVF[index] * 0.1f;	// vert end pos
@@ -287,12 +301,12 @@ __global__ void update_vector_field(float3* pos, unsigned int N, unsigned int cu
 }
 
 extern "C" void launch_vbo_kernel(float3* pos, unsigned int N, unsigned int currentPickedIndex, 
-	float3* inputVF, float3 previewVect)
+	float3* inputVF, float3 previewVect, float time)
 {
 	dim3 block(4, 4, 4);
 	dim3 grid(N / block.x, N / block.y, N / block.z);
 
-	update_vector_field << <grid, block >> > (pos, N, currentPickedIndex, inputVF, previewVect, transferTexObject);
+	update_vector_field << <grid, block >> > (pos, N, currentPickedIndex, inputVF, previewVect, transferTexObject, time);
 
 	checkCudaError("vbo kernel failed!");
 

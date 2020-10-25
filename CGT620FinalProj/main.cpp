@@ -33,6 +33,9 @@ const int vf_scale = 8;
 const float vf_step = 1.0f / vf_scale;
 const int dataSize = vf_scale * vf_scale * vf_scale;
 
+// timer
+float time;
+
 // 3D texture rendering
 GLuint pbo = -1;
 struct cudaGraphicsResource* cuda_pbo_resource;	// pointer to the returned object handle
@@ -72,16 +75,17 @@ float invViewMatrix[12];
 
 // Implement of this function is in kernel.cu
 extern "C" void launch_pbo_kernel(float3* cuda_pbo_result, unsigned int width, unsigned int height,
-	float density, float transferOffset, float transferScale);
+	float density, float transferOffset, float transferScale, float3* d_VF_input, unsigned int N);
 extern "C" void launch_vbo_kernel(float3* cuda_vbo_result, unsigned int vf_scale, unsigned int currentPickedIndex, 
-	float3* d_VF_input, float3 previewVect);
+	float3* d_VF_input, float3 previewVect, float time);
 extern "C" void copyInvViewMatrix(float* invViewMatrix, size_t sizeofMatrix);
 extern "C" void copyVolumeTextures(void* h_volume, cudaExtent volumeScale);
 extern "C" void checkCudaError(const char* msg);
 
 
 // imgui
-bool renderVF = true;
+GLuint pbo_texture = -1;
+
 
 void resetCamera()
 {
@@ -94,10 +98,6 @@ void draw_gui()
 	ImGui_ImplGlut_NewFrame();
 	//ImGui::ShowDemoWindow();
 	ImGui::Begin("Settings");
-	if (ImGui::Checkbox("render Vector field", &renderVF))
-	{
-		resetCamera();	// since those cameras do not perfect match...
-	}
 	if(ImGui::Button("Reset Camera"))
 	{
 		resetCamera();
@@ -119,6 +119,17 @@ void draw_gui()
 	ImGui::SliderFloat("Volume Transfer Offset", &transferOffset, -1.0f, 1.0f);
 	ImGui::SliderFloat("Volume Transfer Scale", &transferScale, 0.0f, 2.0f);
 	ImGui::End();
+
+	ImGui::Begin("Ray marching");
+	glBindBuffer(GL_PIXEL_UNPACK_BUFFER, pbo);
+	glBindTexture(GL_TEXTURE_2D, pbo_texture);
+	glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, width, height,
+		GL_RGB, GL_FLOAT, NULL);
+	ImGui::Image((void*)pbo_texture, ImVec2(512, 512));
+	glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
+
+	ImGui::End();
+
 	ImGui::Render();
 }
 
@@ -131,7 +142,6 @@ void GenVectorField()
 {
 	glGenBuffers(1, &vbo);
 	glBindBuffer(GL_ARRAY_BUFFER, vbo);
-	//glBufferData(GL_ARRAY_BUFFER, sizeof(float3) * dataSize * 2, vfData, GL_DYNAMIC_DRAW);
 	glBufferData(GL_ARRAY_BUFFER, sizeof(float3) * dataSize * 4, 0, GL_STATIC_DRAW);
 
 	glBindBuffer(GL_ARRAY_BUFFER, 0);
@@ -154,20 +164,41 @@ void createPBO()
 	cudaGraphicsGLRegisterBuffer(&cuda_pbo_resource, pbo, cudaGraphicsMapFlagsWriteDiscard);
 }
 
+void createTexture()
+{
+	glEnable(GL_TEXTURE_2D);
+
+	glGenTextures(1, &pbo_texture);
+	glBindTexture(GL_TEXTURE_2D, pbo_texture);
+
+	glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB32F, width, height, 0, GL_RGB, GL_FLOAT, NULL);
+
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+	glBindTexture(GL_TEXTURE_2D, 0);
+
+}
+
+void initInputVF()
+{
+	memset(h_VF_input, 0, sizeof(float3) * dataSize);
+	//for (int i = 0; i < dataSize; i++)
+	//{
+	//	h_VF_input[i].x = sin(i / 4.0f);
+	//	h_VF_input[i].y = cos(i / 4.0f);
+	//	h_VF_input[i].z = sin(i / 4.0f);
+	//}
+}
+
 void setBuffers()
 {
-	//memset(h_VF_input, 0, sizeof(float3) * dataSize);
-	for (int i = 0; i < dataSize; i++)
-	{
-		h_VF_input[i].x = sin(i / 4.0f);
-		h_VF_input[i].y = cos(i / 4.0f);
-		h_VF_input[i].z = sin(i / 4.0f);
-	}
+	initInputVF();
 
 	cudaMalloc((void**)& d_VF_input, sizeof(float3) * dataSize);
 	checkCudaError("Cuda Malloc d_VF_input failed!");
 	GenVectorField();
 	createPBO();
+	createTexture();
 }
 
 void setVolumeTextures()
@@ -204,7 +235,7 @@ void runCuda()
 
 	cudaMemcpy(d_VF_input, h_VF_input, sizeof(float3) * dataSize, cudaMemcpyHostToDevice);
 	checkCudaError("Cuda Memcpy d_VF_input failed!");
-	launch_vbo_kernel(cuda_vbo_result, vf_scale, currentPickedIndex, d_VF_input, previewVect);
+	launch_vbo_kernel(cuda_vbo_result, vf_scale, currentPickedIndex, d_VF_input, previewVect, time);
 
 	cudaGraphicsUnmapResources(1, &cuda_vbo_resource, 0);
 
@@ -215,7 +246,7 @@ void runCuda()
 
 	cudaMemset(cuda_pbo_result, 0, width * height * 3);
 
-	launch_pbo_kernel(cuda_pbo_result, width, height, density, transferOffset, transferScale);
+	launch_pbo_kernel(cuda_pbo_result, width, height, density, transferOffset, transferScale, d_VF_input, vf_scale);
 
 	cudaGraphicsUnmapResources(1, &cuda_pbo_resource, 0);
 }
@@ -270,18 +301,29 @@ void drawVertexField()
 	const int h = glutGet(GLUT_WINDOW_HEIGHT);
 	const float aspect_ratio = float(w) / float(h);
 
-	//glm::vec3 dir;
-
-	//glm::mat4 trans = glm::mat4(1.0f);
-	glm::mat4 M = glm::translate(glm::vec3(vf_step)) * glm::translate(glm::vec3(-viewTranslation.x, -viewTranslation.y, -viewTranslation.z));
-	M = glm::rotate(M, glm::radians(-viewRotation.x), glm::vec3(1, 0, 0));
-	M = glm::rotate(M, glm::radians(viewRotation.y), glm::vec3(0, 1, 0));
-	glm::mat4 V = glm::lookAt(glm::vec3(0.0f, 0.0f, -0.5f), 
-		glm::vec3(0.0f, 0.0f, 0.0f), 
-		glm::vec3(0.0f, 1.0f, 0.0f));
-	glm::mat4 P = glm::perspective(3.141592f / 4.0f, aspect_ratio, 0.1f, 100.0f);
+	// offset
+	glm::mat4 M = glm::translate(glm::vec3(vf_step));
 
 	const int PVM_loc = 0;
+
+	float viewMat[16];
+
+	glMatrixMode(GL_MODELVIEW);
+	glPushMatrix();
+	glLoadIdentity();
+	glTranslatef(viewTranslation.x, viewTranslation.y, viewTranslation.z);
+	glRotatef(viewRotation.y, 0.0, 1.0, 0.0);
+	glRotatef(-viewRotation.x, 1.0, 0.0, 0.0);
+	glGetFloatv(GL_MODELVIEW_MATRIX, viewMat);
+	glPopMatrix();
+
+	glm::mat4 V = glm::mat4(viewMat[0], viewMat[1], viewMat[2], viewMat[3],
+							viewMat[4], viewMat[5], viewMat[6], viewMat[7],
+							viewMat[8], viewMat[9], viewMat[10], viewMat[11],
+							viewMat[12], viewMat[13], viewMat[14], viewMat[15]);
+
+	glm::mat4 P = glm::perspective(3.141592f / 4.0f, aspect_ratio, 0.1f, 100.0f);
+
 	glm::mat4 PVM = P * V * M;
 
 	glUseProgram(shader_program);
@@ -297,6 +339,8 @@ void drawVertexField()
 
 	glLineWidth(1.5f);
 	glDrawArrays(GL_LINES, 0, dataSize*4);
+	//glPointSize(2.0f);
+	//glDrawArrays(GL_POINTS, 0, dataSize*4);
 
 	glDisableClientState(GL_VERTEX_ARRAY);
 
@@ -306,30 +350,24 @@ void drawVertexField()
 	glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);	// in case for imgui's bug
 }
 
-void drawPBO()
-{
-	glUseProgram(0);
-	glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
-	glBindBuffer(GL_PIXEL_UNPACK_BUFFER, pbo);
-	glDrawPixels(width, height, GL_RGB, GL_FLOAT, 0);
-	// unbind
-	glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
-}
-
 void idle()
 {
 	glutPostRedisplay();
 
 	updateCamera();
 
+	// timer
+	time = glutGet(GLUT_ELAPSED_TIME)*0.001f;
 	runCuda();
 	
-	if(renderVF) drawVertexField();
-	else drawPBO();
-
+	drawVertexField();
+	
 	draw_gui();
 
+	
+
 	glutSwapBuffers();
+
 }
 
 // Display info about the OpenGL implementation provided by the graphics driver.
