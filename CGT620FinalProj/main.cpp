@@ -26,10 +26,11 @@
 #include "InitShader.h"
 
 #include "VectorField.h"
+#include "GenerateVolume.h"
 
 const int width = 512;	// width of the figure
 const int height = 512;	// height of the figure
-const int vf_scale = 8;
+const int vf_scale = 32;
 const float vf_step = 1.0f / vf_scale;
 const int dataSize = vf_scale * vf_scale * vf_scale;
 
@@ -41,14 +42,16 @@ GLuint pbo = -1;
 struct cudaGraphicsResource* cuda_pbo_resource;	// pointer to the returned object handle
 float3* cuda_pbo_result;		// place for CUDA output
 // 3D texture data
-const char* volumeFileName = "data/Bucky.raw";
-cudaExtent volumeScale = make_cudaExtent(32, 32, 32);
+const char* volumeFileName = "data/CloudShapeData.raw";
 typedef unsigned char VolumeType;
+unsigned int volume_scale = 256;
+size_t volumeDataSize = sizeof(VolumeType) * volume_scale * volume_scale * volume_scale;
 float density = 0.04f;
 float transferOffset = 0.0f;
 float transferScale = 1.0f;
-float3* d_outputVF;
-
+VolumeType* d_volume_0;
+VolumeType* d_volume_1;
+void* h_volume = malloc(volumeDataSize);
 
 // Vector field
 GLuint vao = -1;
@@ -63,8 +66,9 @@ float3* cuda_vbo_result;
 
 float3* h_VF_input = new float3[dataSize];	// User input vectors
 // two VF buffer for swap
-float3* d_inputVF_0;
-float3* d_inputVF_1;
+float3* d_VF_0;
+float3* d_VF_1;
+float3* d_user_input_VF;
 bool useVF_0 = true;
 unsigned int currentPickedIndex = 0;
 int currentPickedX = 0;
@@ -79,18 +83,22 @@ float3 viewTranslation = make_float3(0.0, 0.0, -5.0f);
 float invViewMatrix[12];
 
 // Implement of this function is in kernel.cu
-extern "C" void launch_pbo_kernel(float3* cuda_pbo_result, unsigned int width, unsigned int height,
-	float density, float transferOffset, float transferScale, unsigned int N, 
-	float3* d_outputVF);
+
 extern "C" void launch_vbo_kernel(float3* cuda_vbo_result, unsigned int vf_scale, unsigned int currentPickedIndex, 
-	float3 previewVect, float time, float3* inputVF, float3* outputVF);
+	float3 previewVect, float time, float3* inputVF, float3* outputVF, float3* user_input_VF);
+extern "C" void launch_advect_kernel(VolumeType* inputVolume, VolumeType* outputVolume, float3* VF, 
+	unsigned int volume_scale, unsigned int vf_scale);
+extern "C" void launch_pbo_kernel(float3* cuda_pbo_result, unsigned int width, unsigned int height,
+	float density, float transferOffset, float transferScale, unsigned int volume_scale, VolumeType* volume);
+
 extern "C" void copyInvViewMatrix(float* invViewMatrix, size_t sizeofMatrix);
-extern "C" void copyVolumeTextures(void* h_volume, cudaExtent volumeScale);
+extern "C" void createTransferTexture();
 extern "C" void checkCudaError(const char* msg);
 
 
 // imgui
 GLuint pbo_texture = -1;
+bool runNextFrame = false;
 
 
 void resetCamera()
@@ -107,6 +115,10 @@ void draw_gui()
 	if(ImGui::Button("Reset Camera"))
 	{
 		resetCamera();
+	}
+	if (ImGui::Button("continue"))
+	{
+		runNextFrame = true;
 	}
 	ImGui::PushItemWidth(240);
 	ImGui::SliderInt("Pick Vector X", &currentPickedX, 0, vf_scale - 1);
@@ -133,7 +145,6 @@ void draw_gui()
 		GL_RGB, GL_FLOAT, NULL);
 	ImGui::Image((void*)pbo_texture, ImVec2(512, 512));
 	glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
-
 	ImGui::End();
 
 	ImGui::Render();
@@ -170,7 +181,7 @@ void createPBO()
 	cudaGraphicsGLRegisterBuffer(&cuda_pbo_resource, pbo, cudaGraphicsMapFlagsWriteDiscard);
 }
 
-void createTexture()
+void createImGuiTexture()
 {
 	glEnable(GL_TEXTURE_2D);
 
@@ -188,107 +199,108 @@ void createTexture()
 void initInputVF()
 {
 	//memset(h_VF_input, 0, sizeof(float3) * dataSize);
-	for (int i = 0; i < dataSize; i++)
+
+	for (int i = 0; i < vf_scale; i++)
 	{
-		h_VF_input[i].x = sin(i / 4.0f);
-		h_VF_input[i].y = cos(i / 4.0f);
-		h_VF_input[i].z = sin(i / 4.0f);
+		for (int j = 0; j < vf_scale; j++)
+		{
+			for (int k = 0; k < vf_scale; k++)
+			{
+				int index = i * vf_scale * vf_scale + j * vf_scale + k;
+				int x = i - vf_scale / 2;
+				int y = j - vf_scale / 2;
+				h_VF_input[index].x = (-x - y) * 0.01f;
+				h_VF_input[index].y = (x - y) * 0.01f;
+				h_VF_input[index].z = 0.0f;
+			}
+		}
 	}
 }
 
-void setBuffers()
+void readVolumefile()
 {
-	initInputVF();
-
-	cudaMalloc((void**)& d_inputVF_0, sizeof(float3) * dataSize);
-	checkCudaError("Cuda Malloc d_inputVF_0 failed!");
-	cudaMalloc((void**)& d_inputVF_1, sizeof(float3) * dataSize);
-	checkCudaError("Cuda Malloc d_inputVF_1 failed!");
-	cudaMalloc((void**)& d_outputVF, sizeof(float3) * dataSize);
-	checkCudaError("Cuda Malloc d_outputVF failed!");
-	GenVectorField();
-	createPBO();
-	createTexture();
-
-	size_t num_bytes;
-	cudaGraphicsMapResources(1, &cuda_vbo_resource, 0);
-	cudaGraphicsResourceGetMappedPointer((void**)& cuda_vbo_result, &num_bytes, cuda_vbo_resource);
-
-	cudaMemcpy(d_inputVF_0, h_VF_input, sizeof(float3) * dataSize, cudaMemcpyHostToDevice);
-	checkCudaError("Cuda Memcpy d_inputVF_0 failed!");
-
-	cudaGraphicsMapResources(1, &cuda_pbo_resource, 0);
-	cudaGraphicsResourceGetMappedPointer((void**)& cuda_pbo_result, &num_bytes, cuda_pbo_resource);
-}
-
-void setVolumeTextures()
-{
-	size_t volumeDataSize = sizeof(VolumeType) * volumeScale.width * volumeScale.height * volumeScale.depth;
 	FILE* fp = fopen(volumeFileName, "rb");
 	if (!fp)
 	{
 		fprintf(stderr, "Error opening file '%s'\n", volumeFileName);
 		return;
 	}
-	void* h_volume = malloc(volumeDataSize);
+	
 	if (h_volume)
 	{
 		size_t read = fread(h_volume, 1, volumeDataSize, fp);
 		printf("Read '%s', %zu bytes\n", volumeFileName, read);
 	}
 	else printf("Malloc '%s' failed!\n", volumeFileName);
-	
-	copyVolumeTextures(h_volume, volumeScale);
-	
-	free(h_volume);
 
 	return;
 }
 
+void setBuffers()
+{
+	initInputVF();
+
+	cudaMalloc((void**)& d_VF_0, sizeof(float3) * dataSize);
+	checkCudaError("Cuda Malloc d_VF_0 failed!");
+	cudaMalloc((void**)& d_VF_1, sizeof(float3) * dataSize);
+	checkCudaError("Cuda Malloc d_VF_1 failed!");
+	cudaMalloc((void**)& d_user_input_VF, sizeof(float3) * dataSize);
+	checkCudaError("Cuda Malloc d_user_input_VF failed!");
+
+	cudaMalloc((void**)& d_volume_0, sizeof(VolumeType) * volumeDataSize);
+	checkCudaError("Cuda Malloc d_volume_0 failed!");
+	cudaMalloc((void**)& d_volume_1, sizeof(VolumeType) * volumeDataSize);
+	checkCudaError("Cuda Malloc d_volume_1 failed!");
+
+	size_t num_bytes;
+	readVolumefile();
+	cudaMemcpy(d_volume_0, h_volume, sizeof(VolumeType) * volumeDataSize, cudaMemcpyHostToDevice);
+	checkCudaError("Cuda Memcpy d_volume_0 failed!");
+	free(h_volume);
+
+	GenVectorField();
+	createPBO();
+	createImGuiTexture();
+
+	
+	cudaGraphicsMapResources(1, &cuda_vbo_resource, 0);
+	cudaGraphicsResourceGetMappedPointer((void**)& cuda_vbo_result, &num_bytes, cuda_vbo_resource);
+
+	cudaMemcpy(d_VF_0, h_VF_input, sizeof(float3) * dataSize, cudaMemcpyHostToDevice);
+	checkCudaError("Cuda Memcpy d_VF_0 failed!");
+
+	cudaGraphicsMapResources(1, &cuda_pbo_resource, 0);
+	cudaGraphicsResourceGetMappedPointer((void**)& cuda_pbo_result, &num_bytes, cuda_pbo_resource);
+	cudaMemset(cuda_pbo_result, 0, width * height * 3);
+}
+
 void runCuda()
 {
-	
-
-	// update vector field kernel
-	
-
-	//cudaMemcpy(d_inputVF_1, h_VF_input, sizeof(float3) * dataSize, cudaMemcpyHostToDevice);
-	//checkCudaError("Cuda Memcpy d_inputVF_1 failed!");
-
-	if (useVF_0)
-	{
-		launch_vbo_kernel(cuda_vbo_result, vf_scale, currentPickedIndex, previewVect, time, d_inputVF_0, d_inputVF_1);
+	cudaMemcpy(d_user_input_VF, h_VF_input, sizeof(float3) * dataSize, cudaMemcpyHostToDevice);
+	checkCudaError("Cuda Memcpy d_user_input_VF failed!");
+	if (useVF_0)	// using VF_0 as input = use volume_0 as input
+	{	
+		// update vector field kernel
+		launch_vbo_kernel(cuda_vbo_result, vf_scale, currentPickedIndex, previewVect, time, d_VF_0, d_VF_1, d_user_input_VF);
+		// volume texture advection
+		launch_advect_kernel(d_volume_0, d_volume_1, d_VF_1, volume_scale, vf_scale);
+		// render 3D texture kernel
+		launch_pbo_kernel(cuda_pbo_result, width, height, density, transferOffset, transferScale, volume_scale, d_volume_1);
 	}
 	else
 	{
-		launch_vbo_kernel(cuda_vbo_result, vf_scale, currentPickedIndex, previewVect, time, d_inputVF_1, d_inputVF_0);
+		// update vector field kernel
+		launch_vbo_kernel(cuda_vbo_result, vf_scale, currentPickedIndex, previewVect, time, d_VF_1, d_VF_0, d_user_input_VF);
+		// volume texture advection
+		launch_advect_kernel(d_volume_1, d_volume_0, d_VF_0, volume_scale, vf_scale);
+		// render 3D texture kernel
+		launch_pbo_kernel(cuda_pbo_result, width, height, density, transferOffset, transferScale, volume_scale, d_volume_0);
 	}
 
+	cudaMemcpy(h_VF_input, d_user_input_VF, sizeof(float3) * dataSize, cudaMemcpyDeviceToHost);
+	checkCudaError("Cuda Memcpy d_user_input_VF failed!");
 
-	// render 3D texture kernel
-	
-	
-
-	cudaMemset(cuda_pbo_result, 0, width * height * 3);
-
-	if (useVF_0)	// using VF_0 as input
-	{
-		//cudaMemcpy(d_outputVF, d_inputVF_1, sizeof(float3) * dataSize, cudaMemcpyDeviceToDevice);
-		launch_pbo_kernel(cuda_pbo_result, width, height, density, transferOffset, transferScale, vf_scale, d_inputVF_1);
-
-	}
-	else
-	{
-		//cudaMemcpy(d_outputVF, d_inputVF_0, sizeof(float3) * dataSize, cudaMemcpyDeviceToDevice);
-		launch_pbo_kernel(cuda_pbo_result, width, height, density, transferOffset, transferScale, vf_scale, d_inputVF_0);
-
-	}
-	
-	//checkCudaError("Cuda Memcpy d_outputVF failed!");
-
-	//cudaGraphicsUnmapResources(1, &cuda_pbo_resource, 0);
-
-	useVF_0 = !useVF_0;
+	useVF_0 = !useVF_0;	// swap
 }
 
 void display()
@@ -398,13 +410,11 @@ void idle()
 
 	// timer
 	time = glutGet(GLUT_ELAPSED_TIME)*0.001f;
-	runCuda();
+	if(runNextFrame) runCuda();
 	
 	drawVertexField();
 	
 	draw_gui();
-
-	
 
 	glutSwapBuffers();
 
@@ -470,7 +480,7 @@ void initOpenGl()
 	//Initialize glew so that new OpenGL function names can be used
 	glewInit();
 
-	glViewport(0, 0, width, height);
+	glViewport(0, 0, 1080, 720);
 	glMatrixMode(GL_PROJECTION);
 	glLoadIdentity();
 
@@ -592,8 +602,8 @@ int main(int argc, char** argv)
 	ImGui_ImplGlut_Init();	
 
 	// buffers setup
-	setBuffers();	// vbo, pbo
-	setVolumeTextures();
+	setBuffers();	// vbo, pbo, volume
+	createTransferTexture();
 
 	//Enter the glut event loop.
 	glutMainLoop();
@@ -603,9 +613,8 @@ int main(int argc, char** argv)
 	// free buffer before close
 	cudaFree(cuda_pbo_result);
 	cudaFree(cuda_vbo_result);
-	cudaFree(d_inputVF_0);
-	cudaFree(d_inputVF_1);
-	cudaFree(d_outputVF);
+	cudaFree(d_VF_0);
+	cudaFree(d_VF_1);
 
 	cudaGraphicsUnmapResources(1, &cuda_vbo_resource, 0);
 	cudaGraphicsUnmapResources(1, &cuda_pbo_resource, 0);

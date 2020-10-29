@@ -42,6 +42,9 @@
     <ClInclude Include="InitShader.h">
       <Filter>Headers</Filter>
     </ClInclude>
+    <ClInclude Include="GenerateVolume.h">
+      <Filter>Headers</Filter>
+    </ClInclude>
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="include\imgui\imgui.cpp">

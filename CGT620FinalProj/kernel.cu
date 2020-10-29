@@ -13,8 +13,7 @@ using namespace std;
 #include <curand_kernel.h>
 
 typedef unsigned char VolumeType;
-cudaArray* d_volumeArray = 0;	// 3D texture Data
-cudaTextureObject_t volumeTexObject; // 3D texture Object
+
 cudaArray* d_transferFuncArray;
 cudaTextureObject_t transferTexObject; // Transfer texture Object
 
@@ -88,48 +87,13 @@ __device__ float4 mul(const float3x4& M, const float4& v)
 	return r;
 }
 
-__device__ unsigned int Index(int x, int y, int z, unsigned int N)
+__device__ unsigned int Index_xyz(int x, int y, int z, unsigned int N)
 {
 	return x * N * N + y * N + z;
 }
 
-extern "C" void copyVolumeTextures(void* h_volume, cudaExtent volumeSize)
+extern "C" void createTransferTexture()
 {
-	// create 3D array
-	cudaChannelFormatDesc channelDesc = cudaCreateChannelDesc<VolumeType>();
-	cudaMalloc3DArray(&d_volumeArray, &channelDesc, volumeSize);
-	checkCudaError("Cuda malloc 3D array failed!");
-
-	// copy data to 3D array
-	cudaMemcpy3DParms copyParams = { 0 };
-	copyParams.srcPtr = make_cudaPitchedPtr(h_volume, volumeSize.width * sizeof(VolumeType), volumeSize.width, volumeSize.height);
-	copyParams.dstArray = d_volumeArray;
-	copyParams.extent = volumeSize;
-	copyParams.kind = cudaMemcpyHostToDevice;
-	cudaMemcpy3D(&copyParams);
-	checkCudaError("Cuda memcpy 3D array failed!");
-
-	cudaResourceDesc            texRes;
-	memset(&texRes, 0, sizeof(cudaResourceDesc));
-
-	texRes.resType = cudaResourceTypeArray;
-	texRes.res.array.array = d_volumeArray;
-
-	cudaTextureDesc             texDescr;
-	memset(&texDescr, 0, sizeof(cudaTextureDesc));
-
-	texDescr.normalizedCoords = true; // access with normalized texture coordinates
-	texDescr.filterMode = cudaFilterModeLinear; // linear interpolation
-
-	texDescr.addressMode[0] = cudaAddressModeClamp;  // clamp texture coordinates
-	texDescr.addressMode[1] = cudaAddressModeClamp;
-	texDescr.addressMode[2] = cudaAddressModeClamp;
-
-	texDescr.readMode = cudaReadModeNormalizedFloat;
-
-	cudaCreateTextureObject(&volumeTexObject, &texRes, &texDescr, NULL);
-	checkCudaError("Cuda create volume texture object failed!");
-
 	// create transfer function texture
 	float4 transferFunc[] =
 	{
@@ -151,11 +115,13 @@ extern "C" void copyVolumeTextures(void* h_volume, cudaExtent volumeSize)
 	cudaMemcpyToArray(d_transferFuncArray, 0, 0, transferFunc, sizeof(transferFunc), cudaMemcpyHostToDevice);
 	checkCudaError("Cuda memcpy transfer texture failed!");
 
+	cudaResourceDesc            texRes;
 	memset(&texRes, 0, sizeof(cudaResourceDesc));
 
 	texRes.resType = cudaResourceTypeArray;
 	texRes.res.array.array = d_transferFuncArray;
 
+	cudaTextureDesc             texDescr;
 	memset(&texDescr, 0, sizeof(cudaTextureDesc));
 
 	texDescr.normalizedCoords = true; // access with normalized texture coordinates
@@ -169,10 +135,76 @@ extern "C" void copyVolumeTextures(void* h_volume, cudaExtent volumeSize)
 	checkCudaError("Cuda create transfer texture failed!");
 }
 
-__global__ void render_3D_texture(float3* result, unsigned int width, unsigned int height, cudaTextureObject_t volumeTex,
-	cudaTextureObject_t transferTex,
-	float density, float transferOffset, float transferScale, unsigned int N,
-	float3* outputVF)
+__device__ unsigned int Index_xyz(int x, int y, int z, int N)
+{
+	return x * N * N + y * N + z;
+}
+
+__device__ unsigned int Index_uvw(float u, float v, float w, int N)
+{
+	unsigned int x = floor(u * N);
+	unsigned int y = floor(v * N);
+	unsigned int z = floor(w * N);
+
+	x = min(max(0, x), N - 1);
+	y = min(max(0, y), N - 1);
+	z = min(max(0, z), N - 1);
+
+	return x * N * N + y * N + z;
+}
+
+
+__global__ void advect_texture(VolumeType* inputVolume, VolumeType* outputVolume, float3*VF,
+	unsigned int volume_scale, unsigned int vf_scale)
+{
+	unsigned int x = blockIdx.x * blockDim.x + threadIdx.x;
+	unsigned int y = blockIdx.y * blockDim.y + threadIdx.y;
+	unsigned int z = blockIdx.z * blockDim.z + threadIdx.z;
+
+	if (x >= volume_scale || y >= volume_scale || z >= volume_scale) return;
+
+	unsigned int volume_index = Index_xyz(x, y, z, volume_scale);
+
+	// advection here
+	float detlaTime = 0.000001f;
+	float u = (float)x / volume_scale;
+	float v = (float)y / volume_scale;
+	float w = (float)z / volume_scale;
+
+	float u0 = u - VF[Index_uvw(u, v, w, vf_scale)].x * detlaTime;
+	float v0 = v - VF[Index_uvw(u, v, w, vf_scale)].y * detlaTime;
+	float w0 = w - VF[Index_uvw(u, v, w, vf_scale)].z * detlaTime;
+
+	outputVolume[volume_index] = inputVolume[Index_uvw(u0, v0, w0, volume_scale)];
+	//outputVolume[volume_index] = unsigned char(u0 * 255);
+
+	return;
+}
+
+extern "C" void launch_advect_kernel(VolumeType* inputVolume, VolumeType* outputVolume, float3* VF, 
+	unsigned int volume_scale, unsigned int vf_scale)
+{
+	dim3 block(4, 4, 4);
+	dim3 grid(volume_scale / block.x, volume_scale / block.y, volume_scale / block.z);
+
+	advect_texture << <grid, block >> > (inputVolume, outputVolume, VF, volume_scale, vf_scale);
+
+	checkCudaError("advert texture kernel failed!");
+
+	cudaThreadSynchronize();
+}
+
+__device__ VolumeType samplerTex3D(VolumeType* volume, unsigned int volume_scale, float i, float j, float k)
+{
+	unsigned int x = floor(i * volume_scale);
+	unsigned int y = floor(j * volume_scale);
+	unsigned int z = floor(k * volume_scale);
+	unsigned int index = Index_xyz(x, y, z, volume_scale);
+	return volume[index];
+}
+
+__global__ void render_3D_texture(float3* result, unsigned int width, unsigned int height, cudaTextureObject_t transferTex,
+	float density, float transferOffset, float transferScale, unsigned int volume_scale, VolumeType* volume)
 {
 	int i = threadIdx.x + blockIdx.x * blockDim.x;
 	int j = threadIdx.y + blockIdx.y * blockDim.y;
@@ -217,15 +249,14 @@ __global__ void render_3D_texture(float3* result, unsigned int width, unsigned i
 		// read from 3D texture
 		// remap position to [0, 1] coordinates
 		float3 rePos = pos * 0.5f + 0.5f;
-		unsigned int x = floor(rePos.x) * N;
-		unsigned int y = floor(rePos.y) * N;
-		unsigned int z = floor(rePos.z) * N;
-		unsigned int index = x * N * N + y * N + z;
 
-		rePos -= outputVF[index] * 0.05f;
+		VolumeType sample = samplerTex3D(volume, volume_scale, rePos.x, rePos.y, rePos.z);
+		float f_sample = sample / 255.0f;
+		float4 color = tex1D<float4>(transferTex, (f_sample - transferOffset) * transferScale);
+		
+		// debug
+		//float4 color = make_float4(rePos, 1.0f);
 
-		float sample = tex3D<float>(volumeTex, rePos.x, rePos.y, rePos.z);
-		float4 color = tex1D<float4>(transferTex, (sample - transferOffset) * transferScale);
 		color.w *= density;
 		
 		color.x *= color.w;
@@ -248,8 +279,7 @@ __global__ void render_3D_texture(float3* result, unsigned int width, unsigned i
 }
 
 extern "C" void launch_pbo_kernel(float3* result, unsigned int width, unsigned int height,
-	float density, float transferOffset, float transferScale, unsigned int N, 
-	float3* outputVF)
+	float density, float transferOffset, float transferScale, unsigned int volume_scale, VolumeType* volume)
 {
 	int tx = 8;
 	int ty = 8;
@@ -257,35 +287,15 @@ extern "C" void launch_pbo_kernel(float3* result, unsigned int width, unsigned i
 	dim3 blocks(width / tx + 1, height / ty + 1);
 	dim3 threads(tx, ty);
 
-	render_3D_texture << <blocks, threads >> > (result, width, height, volumeTexObject, transferTexObject, 
-		density, transferOffset, transferScale, N, outputVF);
+	render_3D_texture << <blocks, threads >> > (result, width, height, transferTexObject, 
+		density, transferOffset, transferScale, volume_scale, volume);
 
 	checkCudaError("pbo kernel failed!");
 }
 
-__device__ unsigned int Index(int x, int y, int z, int N)
-{
-	return x * N * N + y * N + z;
-}
-
-__device__ float3 advect(float3* input, unsigned int N, unsigned int x, unsigned int y, unsigned int z, float time)
-{
-	
-	unsigned int index = Index(x, y, z, N);
-	int x0 = x - input[index].x;
-	int y0 = y - input[index].y;
-	int z0 = z - input[index].z;
-
-	x0 = min(max(x0, 0), N - 1);
-	y0 = min(max(y0, 0), N - 1);
-	z0 = min(max(z0, 0), N - 1);
-
-	return input[Index(x0, y0, z0, N)];
-}
-
 __global__ void update_vector_field(float3* pos, unsigned int N, unsigned int currentPickedIndex,
 	float3 previewVect, cudaTextureObject_t transferTex, float time, 
-	float3* inputVF, float3* outputVF)
+	float3* inputVF, float3* outputVF, float3* user_input_VF)
 {
 	unsigned int x = blockIdx.x * blockDim.x + threadIdx.x;
 	unsigned int y = blockIdx.y * blockDim.y + threadIdx.y;
@@ -307,9 +317,14 @@ __global__ void update_vector_field(float3* pos, unsigned int N, unsigned int cu
 	//float4 color = tex1D<float4>(transferTex, len-0.1f);
 
 	// Vector Field advect
+	outputVF[index] = inputVF[index];
 
-	outputVF[index] = advect(inputVF, N, x, y, z, time);
+	// add user input after advect
+	outputVF[index] += user_input_VF[index];
+	// clear user input after add
+	user_input_VF[index] = make_float3(0.0f);
 
+	// update VBO
 	float3 dir = normalize(outputVF[index]);
 	pos[4 * index] = make_float3(u, v, w);// vert start pos
 	pos[4 * index + 1] = dir * 0.5f + 0.5f;
@@ -326,13 +341,13 @@ __global__ void update_vector_field(float3* pos, unsigned int N, unsigned int cu
 
 extern "C" void launch_vbo_kernel(float3* pos, unsigned int N, unsigned int currentPickedIndex, 
 	float3 previewVect, float time, 
-	float3* inputVF, float3* outputVF)
+	float3* inputVF, float3* outputVF, float3* user_input_VF)
 {
 	dim3 block(4, 4, 4);
 	dim3 grid(N / block.x, N / block.y, N / block.z);
 
 	update_vector_field << <grid, block >> > (pos, N, currentPickedIndex, previewVect, transferTexObject, time,
-		inputVF, outputVF);
+		inputVF, outputVF, user_input_VF);
 
 	checkCudaError("vbo kernel failed!");
 
@@ -341,10 +356,6 @@ extern "C" void launch_vbo_kernel(float3* pos, unsigned int N, unsigned int curr
 
 extern "C" void freeCudaBuffers()
 {
-	cudaDestroyTextureObject(volumeTexObject);
-	checkCudaError("Destroy texture object failed!");
-	cudaFreeArray(d_volumeArray);
-	checkCudaError("Free volume array failed!");
 	cudaDestroyTextureObject(transferTexObject);
 	checkCudaError("Destroy texture object failed!");
 	cudaFreeArray(d_transferFuncArray);
