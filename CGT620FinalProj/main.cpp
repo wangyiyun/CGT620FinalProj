@@ -30,10 +30,13 @@ float time;
 
 const unsigned int tex_width = 512;	// tex_width of the figure
 const unsigned int tex_height = 512;	// tex_height of the figure
+// Field data float4(Vx, Vy, Vz, P) velocity and pressure/power/energy
+const unsigned int VF_data_scale = 256;
+const unsigned int VF_data_size = VF_data_scale * VF_data_scale * VF_data_scale;
 
 // VBO vector field preview
 const unsigned int vf_view_scale = 8;
-const float vf_view_step = 1.0f / vf_view_scale;
+const float vf_view_step = 0.5f / vf_view_scale;
 const unsigned int vf_view_size = vf_view_scale * vf_view_scale * vf_view_scale;
 
 // Vector field view
@@ -43,6 +46,16 @@ static const std::string fragment_shader("shader_frag.glsl");
 GLuint shader_program = -1;
 struct cudaGraphicsResource* cuda_vbo_resource;
 float3* cuda_vbo_result;
+
+//float4* h_user_VF_inout = new float4[VF_data_size];	// User input
+// two VF buffer for swap
+float4* d_VF_0;
+float4* d_VF_1;
+//float4* d_user_input_VF;
+bool useVF_0 = true;	// ping-pong buffer flag
+float3* d_gradient;
+float* d_divergence;
+
 
 // 3D texture rendering
 // diffusion result
@@ -55,18 +68,16 @@ GLuint velocity_pbo = -1;
 struct cudaGraphicsResource* cuda_velocity_resource;
 float3* cuda_velocity_result;	// result of ray marching at velocity
 GLuint velocity_pbo_texture = -1;	// texture for display
-
-// Field data float4(Vx, Vy, Vz, P) velocity and pressure/power/energy
-const unsigned int VF_data_scale = 256;
-const unsigned int VF_data_size = VF_data_scale * VF_data_scale * VF_data_scale;
-//float4* h_user_VF_inout = new float4[VF_data_size];	// User input
-// two VF buffer for swap
-float4* d_VF_0;
-float4* d_VF_1;
-//float4* d_user_input_VF;
-bool useVF_0 = true;	// ping-pong buffer flag
-float3* d_gradient;
-float* d_divergence;
+// gradient display
+GLuint gradient_pbo = -1;
+struct cudaGraphicsResource* cuda_gradient_resource;
+GLuint gradient_pbo_texture = -1;	// texture for display
+float3* cuda_gradient_result;	// result of ray marching at gradient
+// divergence display
+GLuint divergence_pbo = -1;
+struct cudaGraphicsResource* cuda_divergence_resource;
+float3* cuda_divergence_result;	// result of ray marching at divergence
+GLuint divergence_pbo_texture = -1;	// texture for display
 
 // camera
 float3 viewRotation = make_float3(0.0f);
@@ -80,7 +91,8 @@ extern "C" void createTransferTexture();
 // calculate
 extern "C" void launch_gradient_kernel(float4* VF, float3* gradient);
 extern "C" void launch_divergence_kernel(float3* gradient, float* divergence);
-extern "C" void launch_update_VF_kernel(float4* pre_VF, float4* current_VF, float* divergence);
+extern "C" void launch_diffusion_kernel(float4* pre_VF, float4* current_VF, float* divergence);
+extern "C" void launch_advect_kernel(float4* pre_VF, float4* current_VF);
 
 // display
 extern "C" void copyInvViewMatrix(float* invViewMatrix, size_t sizeofMatrix);
@@ -88,6 +100,8 @@ extern "C" void launch_vbo_kernel(float3* cuda_vbo_result, float4* VF, unsigned 
 extern "C" void launch_display_kernel(float4* VF, float3* gradient, float* divergence,
 	float3* cuda_diffusion_result,
 	float3* cuda_velocity_result,
+	float3* cuda_gradient_result,
+	float3* cuda_divergence_result,
 	float density, float transferOffset, float transferScale);
 
 // kernelFunc
@@ -134,12 +148,30 @@ void draw_gui()
 	glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
 	ImGui::End();
 
-	ImGui::Begin("Gradient");
+	ImGui::Begin("Velocity");
 	glBindBuffer(GL_PIXEL_UNPACK_BUFFER, velocity_pbo);
 	glBindTexture(GL_TEXTURE_2D, velocity_pbo_texture);
 	glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, tex_width, tex_height,
 		GL_RGB, GL_FLOAT, NULL);
-	ImGui::Image((void*)velocity_pbo_texture, ImVec2(512, 512));
+	ImGui::Image((void*)velocity_pbo_texture, ImVec2(200, 200));
+	glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
+	ImGui::End();
+
+	ImGui::Begin("Gradient");
+	glBindBuffer(GL_PIXEL_UNPACK_BUFFER, gradient_pbo);
+	glBindTexture(GL_TEXTURE_2D, gradient_pbo_texture);
+	glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, tex_width, tex_height,
+		GL_RGB, GL_FLOAT, NULL);
+	ImGui::Image((void*)gradient_pbo_texture, ImVec2(200, 200));
+	glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
+	ImGui::End();
+
+	ImGui::Begin("Divergence");
+	glBindBuffer(GL_PIXEL_UNPACK_BUFFER, divergence_pbo);
+	glBindTexture(GL_TEXTURE_2D, divergence_pbo_texture);
+	glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, tex_width, tex_height,
+		GL_RGB, GL_FLOAT, NULL);
+	ImGui::Image((void*)divergence_pbo_texture, ImVec2(200, 200));
 	glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
 	ImGui::End();
 
@@ -176,6 +208,18 @@ void createPBOs()
 	glBindBuffer(GL_PIXEL_UNPACK_BUFFER, velocity_pbo);
 	glBufferData(GL_PIXEL_UNPACK_BUFFER, size_tex_data, NULL, GL_DYNAMIC_COPY);
 	cudaGraphicsGLRegisterBuffer(&cuda_velocity_resource, velocity_pbo, cudaGraphicsMapFlagsWriteDiscard);
+
+	// gradient
+	glGenBuffers(1, &gradient_pbo);
+	glBindBuffer(GL_PIXEL_UNPACK_BUFFER, gradient_pbo);
+	glBufferData(GL_PIXEL_UNPACK_BUFFER, size_tex_data, NULL, GL_DYNAMIC_COPY);
+	cudaGraphicsGLRegisterBuffer(&cuda_gradient_resource, gradient_pbo, cudaGraphicsMapFlagsWriteDiscard);
+
+	// divergence
+	glGenBuffers(1, &divergence_pbo);
+	glBindBuffer(GL_PIXEL_UNPACK_BUFFER, divergence_pbo);
+	glBufferData(GL_PIXEL_UNPACK_BUFFER, size_tex_data, NULL, GL_DYNAMIC_COPY);
+	cudaGraphicsGLRegisterBuffer(&cuda_divergence_resource, divergence_pbo, cudaGraphicsMapFlagsWriteDiscard);
 }
 
 void createTextures()
@@ -191,6 +235,22 @@ void createTextures()
 	glEnable(GL_TEXTURE_2D);
 	glGenTextures(1, &velocity_pbo_texture);
 	glBindTexture(GL_TEXTURE_2D, velocity_pbo_texture);
+	glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB32F, tex_width, tex_height, 0, GL_RGB, GL_FLOAT, NULL);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+	glBindTexture(GL_TEXTURE_2D, 0);
+
+	glEnable(GL_TEXTURE_2D);
+	glGenTextures(1, &gradient_pbo_texture);
+	glBindTexture(GL_TEXTURE_2D, gradient_pbo_texture);
+	glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB32F, tex_width, tex_height, 0, GL_RGB, GL_FLOAT, NULL);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+	glBindTexture(GL_TEXTURE_2D, 0);
+
+	glEnable(GL_TEXTURE_2D);
+	glGenTextures(1, &divergence_pbo_texture);
+	glBindTexture(GL_TEXTURE_2D, divergence_pbo_texture);
 	glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB32F, tex_width, tex_height, 0, GL_RGB, GL_FLOAT, NULL);
 	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
 	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
@@ -219,42 +279,63 @@ void initCuda()
 	size_t num_bytes;
 	cudaGraphicsMapResources(1, &cuda_vbo_resource, 0);
 	cudaGraphicsResourceGetMappedPointer((void**)& cuda_vbo_result, &num_bytes, cuda_vbo_resource);
+	checkCudaError("Cuda Map VBO resource failed!");
 
 	cudaGraphicsMapResources(1, &cuda_diffusion_resource, 0);
 	cudaGraphicsResourceGetMappedPointer((void**)& cuda_diffusion_result, &num_bytes, cuda_diffusion_resource);
 	cudaMemset(cuda_diffusion_result, 0, tex_width * tex_height * 3);
+	checkCudaError("Cuda Map diffusion resource failed!");
 
 	cudaGraphicsMapResources(1, &cuda_velocity_resource, 0);
 	cudaGraphicsResourceGetMappedPointer((void**)& cuda_velocity_result, &num_bytes, cuda_velocity_resource);
 	cudaMemset(cuda_velocity_result, 0, tex_width * tex_height * 3);
+	checkCudaError("Cuda Map velocity resource failed!");
+
+	cudaGraphicsMapResources(1, &cuda_gradient_resource, 0);
+	cudaGraphicsResourceGetMappedPointer((void**)& cuda_gradient_result, &num_bytes, cuda_gradient_resource);
+	cudaMemset(cuda_gradient_result, 0, tex_width * tex_height * 3);
+	checkCudaError("Cuda Map gradient resource failed!");
+
+	cudaGraphicsMapResources(1, &cuda_divergence_resource, 0);
+	cudaGraphicsResourceGetMappedPointer((void**)& cuda_divergence_result, &num_bytes, cuda_divergence_resource);
+	cudaMemset(cuda_divergence_result, 0, tex_width * tex_height * 3);
+	checkCudaError("Cuda Map divergence resource failed!");
 }
 
 void runCuda()
 {
-	if (useVF_0)	// using VF_0 as input = use volume_0 as input
+	if (useVF_0)	// (input) VF_0 -> (diffusion) VF_1 -> (advect)(swap) VF_0 -> (output) VF_0 
 	{
 		// calculate
 		launch_gradient_kernel(d_VF_0, d_gradient);
 		launch_divergence_kernel(d_gradient, d_divergence);
-		launch_update_VF_kernel(d_VF_0, d_VF_1, d_divergence);
+		launch_diffusion_kernel(d_VF_0, d_VF_1, d_divergence);
+		//launch_advect_kernel(d_VF_1, d_VF_0);	// include swap
+
 		// display
 		launch_vbo_kernel(cuda_vbo_result, d_VF_1, vf_view_scale);
-		launch_display_kernel(d_VF_1, d_gradient, d_divergence, 
+		launch_display_kernel(d_VF_1, d_gradient, d_divergence,
 			cuda_diffusion_result,
 			cuda_velocity_result,
+			cuda_gradient_result,
+			cuda_divergence_result,
 			density, transferOffset, transferScale);
 	}
-	else
+	else	// (input) VF_1 -> (diffusion) VF_0 -> (advect)(swap) VF_1 -> (output) VF_1 
 	{
 		// calculate
 		launch_gradient_kernel(d_VF_1, d_gradient);
 		launch_divergence_kernel(d_gradient, d_divergence);
-		launch_update_VF_kernel(d_VF_1, d_VF_0, d_divergence);
+		launch_diffusion_kernel(d_VF_1, d_VF_0, d_divergence);
+		//launch_advect_kernel(d_VF_0, d_VF_1);	// include swap
+
 		// display
 		launch_vbo_kernel(cuda_vbo_result, d_VF_0, vf_view_scale);
 		launch_display_kernel(d_VF_0, d_gradient, d_divergence,
 			cuda_diffusion_result,
 			cuda_velocity_result,
+			cuda_gradient_result,
+			cuda_divergence_result,
 			density, transferOffset, transferScale);
 	}
 
@@ -577,6 +658,8 @@ int main(int argc, char** argv)
 	freeCudaTextureBuffers();
 	cudaFree(cuda_diffusion_result);
 	cudaFree(cuda_velocity_result);
+	cudaFree(cuda_gradient_result);
+	cudaFree(cuda_divergence_result);
 	cudaFree(d_VF_0);
 	cudaFree(d_VF_1);
 	cudaFree(d_gradient);
@@ -585,6 +668,8 @@ int main(int argc, char** argv)
 	cudaGraphicsUnmapResources(1, &cuda_vbo_resource, 0);
 	cudaGraphicsUnmapResources(1, &cuda_diffusion_resource, 0);
 	cudaGraphicsUnmapResources(1, &cuda_velocity_resource, 0);
+	cudaGraphicsUnmapResources(1, &cuda_gradient_resource, 0);
+	cudaGraphicsUnmapResources(1, &cuda_divergence_resource, 0);
 
 	ImGui_ImplGlut_Shutdown();
 
