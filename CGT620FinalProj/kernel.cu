@@ -188,6 +188,7 @@ __global__ void fill_volume(float4* VF)
 	// Power
 	//if (length(make_float3(u0, v0, w0) - make_float3(0.0f)) < 0.25f)
 	if (u > 0.25f && u < 0.75f && v > 0.25f && v < 0.75f && w > 0.25f && w < 0.75f)
+	//if (u > 0.25f && u < 0.75f)
 	{
 		VF[index].w = 1.0f;
 	}
@@ -292,7 +293,7 @@ __global__ void updateVF(float4* pre_VF, float4* current_VF, float* divergence)
 
 	unsigned int index = Index_xyz(x, y, z, c_VF_data_scale);
 
-	current_VF[index].w = max(pre_VF[index].w + divergence[index], 0.0f);
+	current_VF[index].w = pre_VF[index].w + divergence[index]* 0.5f;
 }
 
 extern "C" void launch_update_VF_kernel(float4* pre_VF, float4* current_VF, float* divergence)
@@ -365,9 +366,9 @@ __global__ void render(float4* VF, float3* gradient, float* divergence,
 
 		// diffusion
 		float4 diffusion_color = tex1D<float4>(transferTex, (sample.w - transferOffset) * transferScale);
-		//float4 diffusion_color = make_float4(make_float3(sample.w), 1.0f);
-
 		diffusion_color.w = sample.w;
+
+		//float4 diffusion_color = make_float4(sample.w);
 
 		diffusion_sum.x +=  (1.0f - diffusion_sum.w) * diffusion_color.w * diffusion_color.x;
 		diffusion_sum.y +=  (1.0f - diffusion_sum.w) * diffusion_color.w * diffusion_color.y;
@@ -377,10 +378,10 @@ __global__ void render(float4* VF, float3* gradient, float* divergence,
 
 		// velocity
 		float3 velocity = normalize(make_float3(sample.x, sample.y, sample.z)) * 2.0f - 1.0f;
-		float4 velocity_color = make_float4(gradient[sampleIndex] * 0.5f + 0.5f, 1.0f);
-		//float4 velocity_color = make_float4(make_float3(divergence[sampleIndex]) * 0.5f + 0.5f, 1.0f);
+		//float4 velocity_color = make_float4(normalize(gradient[sampleIndex]), 1.0f);
+		float4 velocity_color = make_float4(divergence[sampleIndex]* 10.0f);
 
-		velocity_color.w = sample.w;
+		//velocity_color.w = sample.w;
 
 		velocity_sum.x += (1.0f - velocity_sum.w) * velocity_color.w * velocity_color.x;
 		velocity_sum.y += (1.0f - velocity_sum.w) * velocity_color.w * velocity_color.y;
