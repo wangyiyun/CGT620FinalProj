@@ -25,80 +25,81 @@
 #include "imgui/imgui_impl_glut.h"
 #include "InitShader.h"
 
-#include "VectorField.h"
-#include "GenerateVolume.h"
-
-const int width = 512;	// width of the figure
-const int height = 512;	// height of the figure
-const int vf_scale = 32;
-const float vf_step = 1.0f / vf_scale;
-const int dataSize = vf_scale * vf_scale * vf_scale;
-
 // timer
 float time;
 
-// 3D texture rendering
-GLuint pbo = -1;
-struct cudaGraphicsResource* cuda_pbo_resource;	// pointer to the returned object handle
-float3* cuda_pbo_result;		// place for CUDA output
-// 3D texture data
-const char* volumeFileName = "data/CloudShapeData.raw";
-typedef unsigned char VolumeType;
-unsigned int volume_scale = 256;
-size_t volumeDataSize = sizeof(VolumeType) * volume_scale * volume_scale * volume_scale;
-float density = 0.04f;
-float transferOffset = 0.0f;
-float transferScale = 1.0f;
-VolumeType* d_volume_0;
-VolumeType* d_volume_1;
-void* h_volume = malloc(volumeDataSize);
+const unsigned int tex_width = 512;	// tex_width of the figure
+const unsigned int tex_height = 512;	// tex_height of the figure
 
-// Vector field
-GLuint vao = -1;
+// VBO vector field preview
+const unsigned int vf_view_scale = 8;
+const float vf_view_step = 1.0f / vf_view_scale;
+const unsigned int vf_view_size = vf_view_scale * vf_view_scale * vf_view_scale;
+
+// Vector field view
 GLuint vbo = -1;
-GLuint ebo = -1;
 static const std::string vertex_shader("shader_vert.glsl");
 static const std::string fragment_shader("shader_frag.glsl");
 GLuint shader_program = -1;
-
 struct cudaGraphicsResource* cuda_vbo_resource;
 float3* cuda_vbo_result;
 
-float3* h_VF_input = new float3[dataSize];	// User input vectors
+// 3D texture rendering
+// diffusion result
+GLuint diffusion_pbo = -1;
+struct cudaGraphicsResource* cuda_diffusion_resource;
+float3* cuda_diffusion_result;	// result of ray marching at diffusion
+GLuint diffusion_pbo_texture = -1;	// texture for display
+// velocity display
+GLuint velocity_pbo = -1;
+struct cudaGraphicsResource* cuda_velocity_resource;
+float3* cuda_velocity_result;	// result of ray marching at velocity
+GLuint velocity_pbo_texture = -1;	// texture for display
+
+// Field data float4(Vx, Vy, Vz, P) velocity and pressure/power/energy
+const unsigned int VF_data_scale = 256;
+const unsigned int VF_data_size = VF_data_scale * VF_data_scale * VF_data_scale;
+//float4* h_user_VF_inout = new float4[VF_data_size];	// User input
 // two VF buffer for swap
-float3* d_VF_0;
-float3* d_VF_1;
-float3* d_user_input_VF;
-bool useVF_0 = true;
-unsigned int currentPickedIndex = 0;
-int currentPickedX = 0;
-int currentPickedY = 0;
-int currentPickedZ = 0;
-float currentVect[3] = { 0.0f,0.0f,0.0f };
-float3 previewVect;
+float4* d_VF_0;
+float4* d_VF_1;
+//float4* d_user_input_VF;
+bool useVF_0 = true;	// ping-pong buffer flag
+float3* d_gradient;
+float* d_divergence;
 
 // camera
 float3 viewRotation = make_float3(0.0f);
 float3 viewTranslation = make_float3(0.0, 0.0, -5.0f);
 float invViewMatrix[12];
 
-// Implement of this function is in kernel.cu
-
-extern "C" void launch_vbo_kernel(float3* cuda_vbo_result, unsigned int vf_scale, unsigned int currentPickedIndex, 
-	float3 previewVect, float time, float3* inputVF, float3* outputVF, float3* user_input_VF);
-extern "C" void launch_advect_kernel(VolumeType* inputVolume, VolumeType* outputVolume, float3* VF, 
-	unsigned int volume_scale, unsigned int vf_scale);
-extern "C" void launch_pbo_kernel(float3* cuda_pbo_result, unsigned int width, unsigned int height,
-	float density, float transferOffset, float transferScale, unsigned int volume_scale, VolumeType* volume);
-
-extern "C" void copyInvViewMatrix(float* invViewMatrix, size_t sizeofMatrix);
+// init
+extern "C" void launch_init_VF_kernel(float4* VF);
 extern "C" void createTransferTexture();
+
+// calculate
+extern "C" void launch_gradient_kernel(float4* VF, float3* gradient);
+extern "C" void launch_divergence_kernel(float3* gradient, float* divergence);
+extern "C" void launch_update_VF_kernel(float4* pre_VF, float4* current_VF, float* divergence);
+
+// display
+extern "C" void copyInvViewMatrix(float* invViewMatrix, size_t sizeofMatrix);
+extern "C" void launch_vbo_kernel(float3* cuda_vbo_result, float4* VF, unsigned int vf_view_scale);
+extern "C" void launch_display_kernel(float4* VF, float3* gradient, float* divergence,
+	float3* cuda_diffusion_result,
+	float3* cuda_velocity_result,
+	float density, float transferOffset, float transferScale);
+
+// kernelFunc
 extern "C" void checkCudaError(const char* msg);
+extern "C" void freeCudaTextureBuffers();
 
 
 // imgui
-GLuint pbo_texture = -1;
-bool runNextFrame = false;
+// ray marching parameters
+float density = 0.04f;
+float transferOffset = 0.0f;
+float transferScale = 1.0f;
 
 
 void resetCamera()
@@ -111,194 +112,151 @@ void draw_gui()
 {
 	ImGui_ImplGlut_NewFrame();
 	//ImGui::ShowDemoWindow();
-	ImGui::Begin("Settings");
-	if(ImGui::Button("Reset Camera"))
+	ImGui::Begin("Main control");
+	if (ImGui::Button("Reset Camera"))
 	{
 		resetCamera();
 	}
-	if (ImGui::Button("continue"))
-	{
-		runNextFrame = true;
-	}
-	ImGui::PushItemWidth(240);
-	ImGui::SliderInt("Pick Vector X", &currentPickedX, 0, vf_scale - 1);
-	ImGui::SliderInt("Pick Vector Y", &currentPickedY, 0, vf_scale - 1);
-	ImGui::SliderInt("Pick Vector Z", &currentPickedZ, 0, vf_scale - 1);
-	currentPickedIndex = currentPickedX * vf_scale * vf_scale + currentPickedY * vf_scale + currentPickedZ;
 
-	ImGui::SliderFloat3("Modify Vector", currentVect, -1.0f, 1.0f);
-	previewVect = make_float3(currentVect[0], currentVect[1], currentVect[2]);
-	if (ImGui::Button("Set Vector"))
-	{
-		h_VF_input[currentPickedIndex] = previewVect;
-	}
+	ImGui::PushItemWidth(240);
 
 	ImGui::SliderFloat("Volume Density", &density, 0.0f, 0.2f);
 	ImGui::SliderFloat("Volume Transfer Offset", &transferOffset, -1.0f, 1.0f);
 	ImGui::SliderFloat("Volume Transfer Scale", &transferScale, 0.0f, 2.0f);
 	ImGui::End();
 
-	ImGui::Begin("Ray marching");
-	glBindBuffer(GL_PIXEL_UNPACK_BUFFER, pbo);
-	glBindTexture(GL_TEXTURE_2D, pbo_texture);
-	glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, width, height,
+	ImGui::Begin("Diffusion");
+	glBindBuffer(GL_PIXEL_UNPACK_BUFFER, diffusion_pbo);
+	glBindTexture(GL_TEXTURE_2D, diffusion_pbo_texture);
+	glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, tex_width, tex_height,
 		GL_RGB, GL_FLOAT, NULL);
-	ImGui::Image((void*)pbo_texture, ImVec2(512, 512));
+	ImGui::Image((void*)diffusion_pbo_texture, ImVec2(512, 512));
+	glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
+	ImGui::End();
+
+	ImGui::Begin("Gradient");
+	glBindBuffer(GL_PIXEL_UNPACK_BUFFER, velocity_pbo);
+	glBindTexture(GL_TEXTURE_2D, velocity_pbo_texture);
+	glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, tex_width, tex_height,
+		GL_RGB, GL_FLOAT, NULL);
+	ImGui::Image((void*)velocity_pbo_texture, ImVec2(512, 512));
 	glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
 	ImGui::End();
 
 	ImGui::Render();
 }
 
-float uniformRand()	//(-1,1)
-{
-	return (rand() / (float)RAND_MAX) * 2.0f - 1.0f;
-}
-
-void GenVectorField()
+void createVBO()
 {
 	glGenBuffers(1, &vbo);
 	glBindBuffer(GL_ARRAY_BUFFER, vbo);
-	glBufferData(GL_ARRAY_BUFFER, sizeof(float3) * dataSize * 4, 0, GL_STATIC_DRAW);
+	glBufferData(GL_ARRAY_BUFFER, sizeof(float3) * vf_view_size * 4, 0, GL_STATIC_DRAW);
 
 	glBindBuffer(GL_ARRAY_BUFFER, 0);
 
 	cudaGraphicsGLRegisterBuffer(&cuda_vbo_resource, vbo, cudaGraphicsMapFlagsWriteDiscard);
 }
 
-// create pixel buffer object in OpenGL
-void createPBO()
+// create pixel buffer objects
+void createPBOs()
 {
-	int num_texels = width * height;
+	int num_texels = tex_width * tex_height;
 	int num_values = num_texels * 3;
 
 	int size_tex_data = sizeof(GLfloat) * num_values;
 
-	glGenBuffers(1, &pbo);
-	glBindBuffer(GL_PIXEL_UNPACK_BUFFER, pbo);
+	// diffusion
+	glGenBuffers(1, &diffusion_pbo);
+	glBindBuffer(GL_PIXEL_UNPACK_BUFFER, diffusion_pbo);
 	glBufferData(GL_PIXEL_UNPACK_BUFFER, size_tex_data, NULL, GL_DYNAMIC_COPY);
+	cudaGraphicsGLRegisterBuffer(&cuda_diffusion_resource, diffusion_pbo, cudaGraphicsMapFlagsWriteDiscard);
 
-	cudaGraphicsGLRegisterBuffer(&cuda_pbo_resource, pbo, cudaGraphicsMapFlagsWriteDiscard);
+	// velocity
+	glGenBuffers(1, &velocity_pbo);
+	glBindBuffer(GL_PIXEL_UNPACK_BUFFER, velocity_pbo);
+	glBufferData(GL_PIXEL_UNPACK_BUFFER, size_tex_data, NULL, GL_DYNAMIC_COPY);
+	cudaGraphicsGLRegisterBuffer(&cuda_velocity_resource, velocity_pbo, cudaGraphicsMapFlagsWriteDiscard);
 }
 
-void createImGuiTexture()
+void createTextures()
 {
 	glEnable(GL_TEXTURE_2D);
-
-	glGenTextures(1, &pbo_texture);
-	glBindTexture(GL_TEXTURE_2D, pbo_texture);
-
-	glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB32F, width, height, 0, GL_RGB, GL_FLOAT, NULL);
-
+	glGenTextures(1, &diffusion_pbo_texture);
+	glBindTexture(GL_TEXTURE_2D, diffusion_pbo_texture);
+	glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB32F, tex_width, tex_height, 0, GL_RGB, GL_FLOAT, NULL);
 	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
 	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
 	glBindTexture(GL_TEXTURE_2D, 0);
 
+	glEnable(GL_TEXTURE_2D);
+	glGenTextures(1, &velocity_pbo_texture);
+	glBindTexture(GL_TEXTURE_2D, velocity_pbo_texture);
+	glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB32F, tex_width, tex_height, 0, GL_RGB, GL_FLOAT, NULL);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+	glBindTexture(GL_TEXTURE_2D, 0);
 }
 
-void initInputVF()
+void initCuda()
 {
-	//memset(h_VF_input, 0, sizeof(float3) * dataSize);
-
-	for (int i = 0; i < vf_scale; i++)
-	{
-		for (int j = 0; j < vf_scale; j++)
-		{
-			for (int k = 0; k < vf_scale; k++)
-			{
-				int index = i * vf_scale * vf_scale + j * vf_scale + k;
-				int x = i - vf_scale / 2;
-				int y = j - vf_scale / 2;
-				h_VF_input[index].x = (-x - y) * 0.01f;
-				h_VF_input[index].y = (x - y) * 0.01f;
-				h_VF_input[index].z = 0.0f;
-			}
-		}
-	}
-}
-
-void readVolumefile()
-{
-	FILE* fp = fopen(volumeFileName, "rb");
-	if (!fp)
-	{
-		fprintf(stderr, "Error opening file '%s'\n", volumeFileName);
-		return;
-	}
-	
-	if (h_volume)
-	{
-		size_t read = fread(h_volume, 1, volumeDataSize, fp);
-		printf("Read '%s', %zu bytes\n", volumeFileName, read);
-	}
-	else printf("Malloc '%s' failed!\n", volumeFileName);
-
-	return;
-}
-
-void setBuffers()
-{
-	initInputVF();
-
-	cudaMalloc((void**)& d_VF_0, sizeof(float3) * dataSize);
+	cudaMalloc((void**)& d_VF_0, sizeof(float4) * VF_data_size);
 	checkCudaError("Cuda Malloc d_VF_0 failed!");
-	cudaMalloc((void**)& d_VF_1, sizeof(float3) * dataSize);
+	cudaMalloc((void**)& d_VF_1, sizeof(float4) * VF_data_size);
 	checkCudaError("Cuda Malloc d_VF_1 failed!");
-	cudaMalloc((void**)& d_user_input_VF, sizeof(float3) * dataSize);
-	checkCudaError("Cuda Malloc d_user_input_VF failed!");
 
-	cudaMalloc((void**)& d_volume_0, sizeof(VolumeType) * volumeDataSize);
-	checkCudaError("Cuda Malloc d_volume_0 failed!");
-	cudaMalloc((void**)& d_volume_1, sizeof(VolumeType) * volumeDataSize);
-	checkCudaError("Cuda Malloc d_volume_1 failed!");
+	cudaMalloc((void**)& d_gradient, sizeof(float3) * VF_data_size);
+	checkCudaError("Cuda Malloc d_gradient failed!");
+	cudaMalloc((void**)& d_divergence, sizeof(float) * VF_data_size);
+	checkCudaError("Cuda Malloc d_divergence failed!");
+
+	// fill d_VF_0
+	launch_init_VF_kernel(d_VF_0);
+
+	createVBO();
+	createPBOs();
+	createTextures();
 
 	size_t num_bytes;
-	readVolumefile();
-	cudaMemcpy(d_volume_0, h_volume, sizeof(VolumeType) * volumeDataSize, cudaMemcpyHostToDevice);
-	checkCudaError("Cuda Memcpy d_volume_0 failed!");
-	free(h_volume);
-
-	GenVectorField();
-	createPBO();
-	createImGuiTexture();
-
-	
 	cudaGraphicsMapResources(1, &cuda_vbo_resource, 0);
 	cudaGraphicsResourceGetMappedPointer((void**)& cuda_vbo_result, &num_bytes, cuda_vbo_resource);
 
-	cudaMemcpy(d_VF_0, h_VF_input, sizeof(float3) * dataSize, cudaMemcpyHostToDevice);
-	checkCudaError("Cuda Memcpy d_VF_0 failed!");
+	cudaGraphicsMapResources(1, &cuda_diffusion_resource, 0);
+	cudaGraphicsResourceGetMappedPointer((void**)& cuda_diffusion_result, &num_bytes, cuda_diffusion_resource);
+	cudaMemset(cuda_diffusion_result, 0, tex_width * tex_height * 3);
 
-	cudaGraphicsMapResources(1, &cuda_pbo_resource, 0);
-	cudaGraphicsResourceGetMappedPointer((void**)& cuda_pbo_result, &num_bytes, cuda_pbo_resource);
-	cudaMemset(cuda_pbo_result, 0, width * height * 3);
+	cudaGraphicsMapResources(1, &cuda_velocity_resource, 0);
+	cudaGraphicsResourceGetMappedPointer((void**)& cuda_velocity_result, &num_bytes, cuda_velocity_resource);
+	cudaMemset(cuda_velocity_result, 0, tex_width * tex_height * 3);
 }
 
 void runCuda()
 {
-	cudaMemcpy(d_user_input_VF, h_VF_input, sizeof(float3) * dataSize, cudaMemcpyHostToDevice);
-	checkCudaError("Cuda Memcpy d_user_input_VF failed!");
 	if (useVF_0)	// using VF_0 as input = use volume_0 as input
-	{	
-		// update vector field kernel
-		launch_vbo_kernel(cuda_vbo_result, vf_scale, currentPickedIndex, previewVect, time, d_VF_0, d_VF_1, d_user_input_VF);
-		// volume texture advection
-		launch_advect_kernel(d_volume_0, d_volume_1, d_VF_1, volume_scale, vf_scale);
-		// render 3D texture kernel
-		launch_pbo_kernel(cuda_pbo_result, width, height, density, transferOffset, transferScale, volume_scale, d_volume_1);
+	{
+		// calculate
+		launch_gradient_kernel(d_VF_0, d_gradient);
+		launch_divergence_kernel(d_gradient, d_divergence);
+		launch_update_VF_kernel(d_VF_0, d_VF_1, d_divergence);
+		// display
+		launch_vbo_kernel(cuda_vbo_result, d_VF_1, vf_view_scale);
+		launch_display_kernel(d_VF_1, d_gradient, d_divergence, 
+			cuda_diffusion_result,
+			cuda_velocity_result,
+			density, transferOffset, transferScale);
 	}
 	else
 	{
-		// update vector field kernel
-		launch_vbo_kernel(cuda_vbo_result, vf_scale, currentPickedIndex, previewVect, time, d_VF_1, d_VF_0, d_user_input_VF);
-		// volume texture advection
-		launch_advect_kernel(d_volume_1, d_volume_0, d_VF_0, volume_scale, vf_scale);
-		// render 3D texture kernel
-		launch_pbo_kernel(cuda_pbo_result, width, height, density, transferOffset, transferScale, volume_scale, d_volume_0);
+		// calculate
+		launch_gradient_kernel(d_VF_1, d_gradient);
+		launch_divergence_kernel(d_gradient, d_divergence);
+		launch_update_VF_kernel(d_VF_1, d_VF_0, d_divergence);
+		// display
+		launch_vbo_kernel(cuda_vbo_result, d_VF_0, vf_view_scale);
+		launch_display_kernel(d_VF_0, d_gradient, d_divergence,
+			cuda_diffusion_result,
+			cuda_velocity_result,
+			density, transferOffset, transferScale);
 	}
-
-	cudaMemcpy(h_VF_input, d_user_input_VF, sizeof(float3) * dataSize, cudaMemcpyDeviceToHost);
-	checkCudaError("Cuda Memcpy d_user_input_VF failed!");
 
 	useVF_0 = !useVF_0;	// swap
 }
@@ -354,7 +312,7 @@ void drawVertexField()
 	const float aspect_ratio = float(w) / float(h);
 
 	// offset
-	glm::mat4 M = glm::translate(glm::vec3(vf_step));
+	glm::mat4 M = glm::translate(glm::vec3(vf_view_step));
 
 	const int PVM_loc = 0;
 
@@ -390,7 +348,7 @@ void drawVertexField()
 	glVertexAttribPointer(1, 3, GL_FLOAT, GL_FALSE, 6 * sizeof(GLfloat), (GLvoid*)(3 * sizeof(GLfloat)));
 
 	glLineWidth(1.5f);
-	glDrawArrays(GL_LINES, 0, dataSize*4);
+	glDrawArrays(GL_LINES, 0, vf_view_size *4);
 	//glPointSize(2.0f);
 	//glDrawArrays(GL_POINTS, 0, dataSize*4);
 
@@ -409,15 +367,20 @@ void idle()
 	updateCamera();
 
 	// timer
-	time = glutGet(GLUT_ELAPSED_TIME)*0.001f;
-	if(runNextFrame) runCuda();
-	
+	//time = glutGet(GLUT_ELAPSED_TIME)*0.001f;
+	runCuda();
+
+	glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+
+	const int w = glutGet(GLUT_WINDOW_WIDTH);
+	const int h = glutGet(GLUT_WINDOW_HEIGHT);
+	const float aspect_ratio = float(w) / float(h);
+
 	drawVertexField();
 	
 	draw_gui();
 
 	glutSwapBuffers();
-
 }
 
 // Display info about the OpenGL implementation provided by the graphics driver.
@@ -480,7 +443,7 @@ void initOpenGl()
 	//Initialize glew so that new OpenGL function names can be used
 	glewInit();
 
-	glViewport(0, 0, 1080, 720);
+	glViewport(0, 0, tex_width, tex_height);
 	glMatrixMode(GL_PROJECTION);
 	glLoadIdentity();
 
@@ -581,7 +544,7 @@ int main(int argc, char** argv)
 	glutInit(&argc, argv);
 	glutInitDisplayMode(GLUT_DOUBLE | GLUT_RGBA | GLUT_DEPTH);
 	glutInitWindowPosition(5, 5);
-	glutInitWindowSize(width, height);
+	glutInitWindowSize(1920, 1080);
 	int win = glutCreateWindow("CGT620FinalProj");
 
 	//Register callback functions with glut. 
@@ -602,7 +565,7 @@ int main(int argc, char** argv)
 	ImGui_ImplGlut_Init();	
 
 	// buffers setup
-	setBuffers();	// vbo, pbo, volume
+	initCuda();
 	createTransferTexture();
 
 	//Enter the glut event loop.
@@ -611,15 +574,17 @@ int main(int argc, char** argv)
 	glutDestroyWindow(win);
 
 	// free buffer before close
-	cudaFree(cuda_pbo_result);
-	cudaFree(cuda_vbo_result);
+	freeCudaTextureBuffers();
+	cudaFree(cuda_diffusion_result);
+	cudaFree(cuda_velocity_result);
 	cudaFree(d_VF_0);
 	cudaFree(d_VF_1);
+	cudaFree(d_gradient);
+	cudaFree(d_divergence);
 
 	cudaGraphicsUnmapResources(1, &cuda_vbo_resource, 0);
-	cudaGraphicsUnmapResources(1, &cuda_pbo_resource, 0);
-
-	delete[] h_VF_input;
+	cudaGraphicsUnmapResources(1, &cuda_diffusion_resource, 0);
+	cudaGraphicsUnmapResources(1, &cuda_velocity_resource, 0);
 
 	ImGui_ImplGlut_Shutdown();
 

@@ -36,13 +36,7 @@
     <ClInclude Include="include\imgui\imstb_truetype.h">
       <Filter>ImGui</Filter>
     </ClInclude>
-    <ClInclude Include="VectorField.h">
-      <Filter>Headers</Filter>
-    </ClInclude>
     <ClInclude Include="InitShader.h">
-      <Filter>Headers</Filter>
-    </ClInclude>
-    <ClInclude Include="GenerateVolume.h">
       <Filter>Headers</Filter>
     </ClInclude>
   </ItemGroup>
