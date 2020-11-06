@@ -186,7 +186,9 @@ __global__ void fill_volume(float4* VF)
 	VF[index].z = 0.0f;
 
 	// Power
-	if (u > 0.25f && u < 0.75f && v > 0.25f && v < 0.75f && w > 0.25f && w < 0.75f)
+	//if (u > 0.25f && u < 0.75f && v > 0.25f && v < 0.75f && w > 0.25f && w < 0.75f)
+	if (length(make_float3(u0,v0,w0) - make_float3(0.0f, -0.5f, 0.0f))< 0.5f ||
+		length(make_float3(u0, v0, w0) - make_float3(0.0f, 0.5f, 0.0f)) < 0.5f)
 	//if (u > 0.25f && u < 0.75f)
 	{
 		VF[index].w = 1.0f;
@@ -300,7 +302,7 @@ __global__ void diffusion(float4* pre_VF, float4* current_VF, float* divergence)
 	float dt = 0.5f;
 
 	// power
-	current_VF[index].w = pre_VF[index].w + divergence[index]* dt;
+	current_VF[index].w = abs(pre_VF[index].w + divergence[index]* dt);
 }
 
 extern "C" void launch_diffusion_kernel(float4* pre_VF, float4* current_VF, float* divergence)
@@ -480,10 +482,10 @@ __global__ void render(float4* VF, float3* gradient, float* divergence,
 		pos += ray.dir * dt;
 	}
 
-	cuda_diffusion_result[index] = make_float3(diffusion_sum.x, diffusion_sum.y, diffusion_sum.z);
-	cuda_velocity_result[index] = make_float3(velocity_sum.x, velocity_sum.y, velocity_sum.z);
-	cuda_gradient_result[index] = make_float3(gradient_sum.x, gradient_sum.y, gradient_sum.z);
-	cuda_divergence_result[index] = make_float3(divergence_sum.x, divergence_sum.y, divergence_sum.z);
+	cuda_diffusion_result[index] = Clamp_01(make_float3(diffusion_sum.x, diffusion_sum.y, diffusion_sum.z));
+	cuda_velocity_result[index] = Clamp_01(make_float3(velocity_sum.x, velocity_sum.y, velocity_sum.z));
+	cuda_gradient_result[index] = Clamp_01(make_float3(gradient_sum.x, gradient_sum.y, gradient_sum.z));
+	cuda_divergence_result[index] = Clamp_01(make_float3(divergence_sum.x, divergence_sum.y, divergence_sum.z));
 	return;
 }
 
