@@ -181,7 +181,7 @@ __global__ void fill_volume(float4* VF)
 	float w0 = w * 2.0f - 1.0f;
 
 	// velocity
-	VF[index].x = u0 * 0.01f;
+	VF[index].x = u0*0.01f;
 	VF[index].y = 0.0f;
 	VF[index].z = 0.0f;
 
@@ -297,7 +297,7 @@ __global__ void diffusion(float4* pre_VF, float4* current_VF, float* divergence)
 	current_VF[index].y = pre_VF[index].y;
 	current_VF[index].z = pre_VF[index].z;
 	
-	float dt = 0.6f;
+	float dt = 0.5f;
 
 	// power
 	current_VF[index].w = pre_VF[index].w + divergence[index]* dt;
@@ -327,14 +327,20 @@ __global__ void advect(float4* pre_VF, float4* current_VF)
 
 	float dt = 0.01f;
 	// (0, 1)
+	float u = (float)x / c_VF_data_scale;
+	float v = (float)y / c_VF_data_scale;
+	float w = (float)z / c_VF_data_scale;
 
-	unsigned int x0 = x - current_VF[index].x * dt;
-	unsigned int y0 = y - current_VF[index].y * dt;
-	unsigned int z0 = z - current_VF[index].z * dt;
+	float u0 = u - current_VF[index].x * dt;
+	float v0 = v - current_VF[index].y * dt;
+	float w0 = w - current_VF[index].z * dt;
 
-
+	// velocity
+	current_VF[index].x = pre_VF[index].x;
+	current_VF[index].y = pre_VF[index].y;
+	current_VF[index].z = pre_VF[index].z;
 	// power
-	current_VF[index].w = pre_VF[Index_xyz(x0, y0, z0, c_VF_data_scale)].w;
+	current_VF[index].w = pre_VF[Index_uvw(u0, v0, w0, c_VF_data_scale)].w;
 }
 
 __global__ void swap(float4* pre_VF, float4* current_VF)
@@ -347,6 +353,10 @@ __global__ void swap(float4* pre_VF, float4* current_VF)
 
 	unsigned int index = Index_xyz(x, y, z, c_VF_data_scale);
 
+	// velocity
+	current_VF[index].x = pre_VF[index].x;
+	current_VF[index].y = pre_VF[index].y;
+	current_VF[index].z = pre_VF[index].z;
 	// power
 	current_VF[index].w = pre_VF[index].w;
 }
@@ -363,6 +373,8 @@ extern "C" void launch_advect_kernel(float4* pre_VF, float4* current_VF)
 	cudaThreadSynchronize();
 
 	swap << <grid, block >> > (current_VF, pre_VF);
+
+	checkCudaError("Swap kernel failed!");
 
 	cudaThreadSynchronize();
 }
@@ -415,8 +427,6 @@ __global__ void render(float4* VF, float3* gradient, float* divergence,
 	// ray marching parameters
 	const float opacityThreshold = 0.95f;
 
-	//float3 dt_vec = 1.0f / (make_float3(c_VF_data_scale) * ray.dir);
-	//float dt = min(dt_vec.x, min(dt_vec.y, dt_vec.z));
 	float dt = 0.05f;
 	float INF = 0.01f;
 	
@@ -431,8 +441,8 @@ __global__ void render(float4* VF, float3* gradient, float* divergence,
 		float4 sample = VF[sampleIndex];
 
 		// diffusion
-		float4 diffusion_color = tex1D<float4>(transferTex, (sample.w - transferOffset) * transferScale);
-		diffusion_color.w = sample.w;
+		float4 diffusion_color = tex1D<float4>(transferTex, (abs(sample.w) - transferOffset) * transferScale);
+		diffusion_color.w = abs(sample.w);
 
 		diffusion_sum.x +=  (1.0f - diffusion_sum.w) * diffusion_color.w * diffusion_color.x;
 		diffusion_sum.y +=  (1.0f - diffusion_sum.w) * diffusion_color.w * diffusion_color.y;
@@ -440,8 +450,8 @@ __global__ void render(float4* VF, float3* gradient, float* divergence,
 		diffusion_sum.w += (1.0f - diffusion_sum.w) * diffusion_color.w;
 
 		// velocity
-		float3 velocity = normalize(make_float3(sample.x, sample.y, sample.z)) * 0.5f + 0.5f;
-		float4 velocity_color = make_float4(velocity, 1.0f);
+		float3 velocity_dir = normalize(make_float3(sample.x, sample.y, sample.z)) * 0.5f + 0.5f;
+		float4 velocity_color = make_float4(velocity_dir, 1.0f);
 
 		velocity_sum.x += (1.0f - velocity_sum.w) * velocity_color.w * velocity_color.x;
 		velocity_sum.y += (1.0f - velocity_sum.w) * velocity_color.w * velocity_color.y;
@@ -470,10 +480,10 @@ __global__ void render(float4* VF, float3* gradient, float* divergence,
 		pos += ray.dir * dt;
 	}
 
-	cuda_diffusion_result[index] = Clamp_01(make_float3(diffusion_sum.x, diffusion_sum.y, diffusion_sum.z));
-	cuda_velocity_result[index] = Clamp_01(make_float3(velocity_sum.x, velocity_sum.y, velocity_sum.z));
-	cuda_gradient_result[index] = Clamp_01(make_float3(gradient_sum.x, gradient_sum.y, gradient_sum.z));
-	cuda_divergence_result[index] = Clamp_01(make_float3(divergence_sum.x, divergence_sum.y, divergence_sum.z));
+	cuda_diffusion_result[index] = make_float3(diffusion_sum.x, diffusion_sum.y, diffusion_sum.z);
+	cuda_velocity_result[index] = make_float3(velocity_sum.x, velocity_sum.y, velocity_sum.z);
+	cuda_gradient_result[index] = make_float3(gradient_sum.x, gradient_sum.y, gradient_sum.z);
+	cuda_divergence_result[index] = make_float3(divergence_sum.x, divergence_sum.y, divergence_sum.z);
 	return;
 }
 

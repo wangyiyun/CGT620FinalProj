@@ -134,7 +134,7 @@ void draw_gui()
 
 	ImGui::PushItemWidth(240);
 
-	ImGui::SliderFloat("Volume Density", &density, 0.0f, 0.2f);
+	//ImGui::SliderFloat("Volume Density", &density, 0.0f, 0.2f);
 	ImGui::SliderFloat("Volume Transfer Offset", &transferOffset, -1.0f, 1.0f);
 	ImGui::SliderFloat("Volume Transfer Scale", &transferScale, 0.0f, 2.0f);
 	ImGui::End();
@@ -304,13 +304,13 @@ void initCuda()
 
 void runCuda()
 {
-	if (useVF_0)	// (input) VF_0 -> (diffusion) VF_1 -> (advect)(swap) VF_0 -> (output) VF_0 
+	if (useVF_0)	// (input) VF_0 -> (diffusion) VF_1 -> (advect)(swap) VF_0 -> (output) VF_1 
 	{
 		// calculate
 		launch_gradient_kernel(d_VF_0, d_gradient);
 		launch_divergence_kernel(d_gradient, d_divergence);
 		launch_diffusion_kernel(d_VF_0, d_VF_1, d_divergence);
-		//launch_advect_kernel(d_VF_1, d_VF_0);	// include swap
+		launch_advect_kernel(d_VF_1, d_VF_0);	// include swap
 
 		// display
 		launch_vbo_kernel(cuda_vbo_result, d_VF_1, vf_view_scale);
@@ -321,13 +321,13 @@ void runCuda()
 			cuda_divergence_result,
 			density, transferOffset, transferScale);
 	}
-	else	// (input) VF_1 -> (diffusion) VF_0 -> (advect)(swap) VF_1 -> (output) VF_1 
+	else	// (input) VF_1 -> (diffusion) VF_0 -> (advect)(swap) VF_1 -> (output) VF_0 
 	{
 		// calculate
 		launch_gradient_kernel(d_VF_1, d_gradient);
 		launch_divergence_kernel(d_gradient, d_divergence);
 		launch_diffusion_kernel(d_VF_1, d_VF_0, d_divergence);
-		//launch_advect_kernel(d_VF_0, d_VF_1);	// include swap
+		launch_advect_kernel(d_VF_0, d_VF_1);	// include swap
 
 		// display
 		launch_vbo_kernel(cuda_vbo_result, d_VF_0, vf_view_scale);
