@@ -31,11 +31,11 @@ float time;
 const unsigned int tex_width = 512;	// tex_width of the figure
 const unsigned int tex_height = 512;	// tex_height of the figure
 // Field data float4(Vx, Vy, Vz, P) velocity and pressure/power/energy
-const unsigned int VF_data_scale = 256;
+const unsigned int VF_data_scale = 400;
 const unsigned int VF_data_size = VF_data_scale * VF_data_scale * VF_data_scale;
 
 // VBO vector field preview
-const unsigned int vf_view_scale = 8;
+const unsigned int vf_view_scale = 32;
 const float vf_view_step = 0.5f / vf_view_scale;
 const unsigned int vf_view_size = vf_view_scale * vf_view_scale * vf_view_scale;
 

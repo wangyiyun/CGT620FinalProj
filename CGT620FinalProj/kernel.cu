@@ -14,10 +14,10 @@ using namespace std;
 cudaArray* d_transferFuncArray;
 cudaTextureObject_t transferTexObject; // Transfer texture Object
 
-__constant__ unsigned int c_VF_data_scale = 256;
+__constant__ unsigned int c_VF_data_scale = 400;
 __constant__ unsigned int c_tex_width = 512;
 __constant__ unsigned int c_tex_height = 512;
-unsigned int h_VF_data_scale = 256;
+unsigned int h_VF_data_scale = 400;
 unsigned int h_tex_width = 512;
 unsigned int h_tex_height = 512;
 
@@ -144,20 +144,24 @@ __device__ float3 Clamp_01(float3 p)
 
 __device__ unsigned int Index_xyz(int x, int y, int z, int N)
 {
+	if (x < 0) x += N;
+	else if (x >= N) x -= N;
+	if (y < 0) y += N;
+	else if (y >= N) y -= N;
+	if (z < 0) z += N;
+	else if (z >= N) z -= N;
+
 	return x * N * N + y * N + z;
 }
 
+// only use for render! floor is not accurate 
 __device__ unsigned int Index_uvw(float u, float v, float w, int N)
 {
 	unsigned int x = floor(u * N);
 	unsigned int y = floor(v * N);
 	unsigned int z = floor(w * N);
 
-	x = min(max(0, x), N - 1);
-	y = min(max(0, y), N - 1);
-	z = min(max(0, z), N - 1);
-
-	return x * N * N + y * N + z;
+	return Index_xyz(x, y, z, N);
 }
 
 __global__ void fill_volume(float4* VF)
@@ -181,14 +185,14 @@ __global__ void fill_volume(float4* VF)
 	float w0 = w * 2.0f - 1.0f;
 
 	// velocity
-	VF[index].x = u0*0.01f;
-	VF[index].y = 0.0f;
+	VF[index].x = u0 * 0.01f;
+	VF[index].y = v0 * 0.01f;
 	VF[index].z = 0.0f;
 
 	// Power
-	//if (u > 0.25f && u < 0.75f && v > 0.25f && v < 0.75f && w > 0.25f && w < 0.75f)
-	if (length(make_float3(u0,v0,w0) - make_float3(0.0f, -0.5f, 0.0f))< 0.5f ||
-		length(make_float3(u0, v0, w0) - make_float3(0.0f, 0.5f, 0.0f)) < 0.5f)
+	if (u > 0.25f && u < 0.75f && v > 0.25f && v < 0.75f && w > 0.25f && w < 0.75f)
+	//if (length(make_float3(u0,v0,w0) - make_float3(0.0f, -0.5f, 0.0f))< 0.5f ||
+	//	length(make_float3(u0, v0, w0) - make_float3(0.0f, 0.5f, 0.0f)) < 0.5f)
 	//if (u > 0.25f && u < 0.75f)
 	{
 		VF[index].w = 1.0f;
@@ -219,17 +223,11 @@ __global__ void calculte_gradient(float4* VF, float3* gradient)
 	unsigned int index = Index_xyz(x, y, z, c_VF_data_scale);
 
 	// Gx of VF[index].w
-	if (x == 0) gradient[index].x = VF[Index_xyz(x + 1, y, z, c_VF_data_scale)].w - VF[index].w;
-	else if (x == c_VF_data_scale - 1) gradient[index].x = VF[index].w - VF[Index_xyz(x - 1, y, z, c_VF_data_scale)].w;
-	else gradient[index].x = 0.5f * (VF[Index_xyz(x + 1, y, z, c_VF_data_scale)].w - VF[Index_xyz(x - 1, y, z, c_VF_data_scale)].w);
+	gradient[index].x = 0.5f * (VF[Index_xyz(x + 1, y, z, c_VF_data_scale)].w - VF[Index_xyz(x - 1, y, z, c_VF_data_scale)].w);
 	// Gy of VF[index].w
-	if (y == 0) gradient[index].y = VF[Index_xyz(x, y + 1, z, c_VF_data_scale)].w - VF[index].w;
-	else if (y == c_VF_data_scale - 1) gradient[index].y = VF[index].w - VF[Index_xyz(x, y - 1, z, c_VF_data_scale)].w;
-	else gradient[index].y = 0.5f * (VF[Index_xyz(x, y + 1, z, c_VF_data_scale)].w - VF[Index_xyz(x, y - 1, z, c_VF_data_scale)].w);
+	gradient[index].y = 0.5f * (VF[Index_xyz(x, y + 1, z, c_VF_data_scale)].w - VF[Index_xyz(x, y - 1, z, c_VF_data_scale)].w);
 	// Gz of of VF[index].w
-	if (z == 0) gradient[index].z = VF[Index_xyz(x, y, z + 1, c_VF_data_scale)].w - VF[index].w;
-	else if (z == c_VF_data_scale - 1) gradient[index].z = VF[index].w - VF[Index_xyz(x, y, z - 1, c_VF_data_scale)].w;
-	else gradient[index].z = 0.5f * (VF[Index_xyz(x, y, z + 1, c_VF_data_scale)].w - VF[Index_xyz(x, y, z - 1, c_VF_data_scale)].w);
+	gradient[index].z = 0.5f * (VF[Index_xyz(x, y, z + 1, c_VF_data_scale)].w - VF[Index_xyz(x, y, z - 1, c_VF_data_scale)].w);
 }
 
 extern "C" void launch_gradient_kernel(float4* VF, float3* gradient)
@@ -257,17 +255,11 @@ __global__ void calculte_divergence(float3* gradient, float* divergence)
 	float3 div = make_float3(0.0f);
 
 	// Dx
-	if (x == 0) div.x = gradient[Index_xyz(x + 1, y, z, c_VF_data_scale)].x - gradient[index].x;
-	else if (x == c_VF_data_scale - 1) div.x = gradient[index].x - gradient[Index_xyz(x - 1, y, z, c_VF_data_scale)].x;
-	else div.x = 0.5f * (gradient[Index_xyz(x + 1, y, z, c_VF_data_scale)].x - gradient[Index_xyz(x - 1, y, z, c_VF_data_scale)].x);
+	div.x = 0.5f * (gradient[Index_xyz(x + 1, y, z, c_VF_data_scale)].x - gradient[Index_xyz(x - 1, y, z, c_VF_data_scale)].x);
 	// Dy
-	if (y == 0) div.y = gradient[Index_xyz(x, y + 1, z, c_VF_data_scale)].y - gradient[index].y;
-	else if (y == c_VF_data_scale - 1) div.y = gradient[index].y - gradient[Index_xyz(x, y - 1, z, c_VF_data_scale)].y;
-	else div.y = 0.5f * (gradient[Index_xyz(x, y + 1, z, c_VF_data_scale)].y - gradient[Index_xyz(x, y - 1, z, c_VF_data_scale)].y);
+	div.y = 0.5f * (gradient[Index_xyz(x, y + 1, z, c_VF_data_scale)].y - gradient[Index_xyz(x, y - 1, z, c_VF_data_scale)].y);
 	// Dz
-	if (z == 0) div.z = gradient[Index_xyz(x, y, z + 1, c_VF_data_scale)].z - gradient[index].z;
-	else if (z == c_VF_data_scale - 1) div.z = gradient[index].z - gradient[Index_xyz(x, y, z - 1, c_VF_data_scale)].z;
-	else div.z = 0.5f * (gradient[Index_xyz(x, y, z + 1, c_VF_data_scale)].z - gradient[Index_xyz(x, y, z - 1, c_VF_data_scale)].z);
+	div.z = 0.5f * (gradient[Index_xyz(x, y, z + 1, c_VF_data_scale)].z - gradient[Index_xyz(x, y, z - 1, c_VF_data_scale)].z);
 
 	divergence[index] = div.x + div.y + div.z;
 }
@@ -302,7 +294,8 @@ __global__ void diffusion(float4* pre_VF, float4* current_VF, float* divergence)
 	float dt = 0.5f;
 
 	// power
-	current_VF[index].w = abs(pre_VF[index].w + divergence[index]* dt);
+	current_VF[index].w = pre_VF[index].w + divergence[index]* dt;
+	//current_VF[index].w = pre_VF[index].w;
 }
 
 extern "C" void launch_diffusion_kernel(float4* pre_VF, float4* current_VF, float* divergence)
@@ -327,22 +320,19 @@ __global__ void advect(float4* pre_VF, float4* current_VF)
 
 	unsigned int index = Index_xyz(x, y, z, c_VF_data_scale);
 
-	float dt = 0.01f;
-	// (0, 1)
-	float u = (float)x / c_VF_data_scale;
-	float v = (float)y / c_VF_data_scale;
-	float w = (float)z / c_VF_data_scale;
+	float dt = 0.05f;
 
-	float u0 = u - current_VF[index].x * dt;
-	float v0 = v - current_VF[index].y * dt;
-	float w0 = w - current_VF[index].z * dt;
+	unsigned int x0, y0, z0;
+	// at least move one step when dt is too small
+	if (current_VF[index].x < 0) x0 = ceil(x - current_VF[index].x * dt);
+	else x0 = floor(x - current_VF[index].x * dt);
+	if (current_VF[index].y < 0) y0 = ceil(y - current_VF[index].y * dt);
+	else y0 = floor(y - current_VF[index].y * dt);
+	if (current_VF[index].z < 0) z0 = ceil(z - current_VF[index].z * dt);
+	else z0 = floor(z - current_VF[index].z * dt);
 
-	// velocity
-	current_VF[index].x = pre_VF[index].x;
-	current_VF[index].y = pre_VF[index].y;
-	current_VF[index].z = pre_VF[index].z;
 	// power
-	current_VF[index].w = pre_VF[Index_uvw(u0, v0, w0, c_VF_data_scale)].w;
+	current_VF[index].w = current_VF[index].w*0.5f + pre_VF[Index_xyz(x0, y0, z0, c_VF_data_scale)].w*0.5f;
 }
 
 __global__ void swap(float4* pre_VF, float4* current_VF)
@@ -355,10 +345,6 @@ __global__ void swap(float4* pre_VF, float4* current_VF)
 
 	unsigned int index = Index_xyz(x, y, z, c_VF_data_scale);
 
-	// velocity
-	current_VF[index].x = pre_VF[index].x;
-	current_VF[index].y = pre_VF[index].y;
-	current_VF[index].z = pre_VF[index].z;
 	// power
 	current_VF[index].w = pre_VF[index].w;
 }
@@ -444,7 +430,8 @@ __global__ void render(float4* VF, float3* gradient, float* divergence,
 
 		// diffusion
 		float4 diffusion_color = tex1D<float4>(transferTex, (abs(sample.w) - transferOffset) * transferScale);
-		diffusion_color.w = abs(sample.w);
+		//diffusion_color = make_float4(rePos, sample.w);
+		diffusion_color.w = sample.w * 0.1f;
 
 		diffusion_sum.x +=  (1.0f - diffusion_sum.w) * diffusion_color.w * diffusion_color.x;
 		diffusion_sum.y +=  (1.0f - diffusion_sum.w) * diffusion_color.w * diffusion_color.y;
