@@ -143,12 +143,23 @@ void draw_gui()
 	}
 
 	ImGui::PushItemWidth(240);
-
+	if (ImGui::Button("Reset Cursor"))
+	{
+		cursor_pos[0] = 0.0f;
+		cursor_pos[1] = 0.0f;
+		cursor_pos[2] = 0.0f;
+		cursor_divergence = 0.0f;
+		cursor_curl[0] = 0.0f;
+		cursor_curl[1] = 0.0f;
+		cursor_curl[2] = 0.0f;
+		cursor_radius = 0.1f;
+	}
 	ImGui::SliderFloat3("Cursor Pos", cursor_pos, -1.0f, 1.0f);
 	ImGui::SliderFloat("Cursor Divergence", &cursor_divergence, -2.0f, 2.0f);
 	ImGui::SliderFloat3("Cursor Curl", cursor_curl, -1.0f, 1.0f);
 	ImGui::SliderFloat("Cursor Radius", &cursor_radius, 0.0f, 1.0f);
-	if (ImGui::Button("Set Velocities"))
+	ImGui::SliderFloat("Cursor Density", &cursor_density, 0.0f, 1.0f);
+	if (ImGui::Button("Add Velocities"))
 	{
 		launch_set_velocity_kernel(d_VF_0, d_VF_1, make_float3(cursor_pos[0], cursor_pos[1], cursor_pos[2]) * 0.5f + 0.5f,
 			cursor_divergence, make_float3(cursor_curl[0], cursor_curl[1], cursor_curl[2]), cursor_radius);
@@ -158,7 +169,7 @@ void draw_gui()
 	{
 		launch_clear_velocity_kernel(d_VF_0, d_VF_1);
 	}
-	if (ImGui::Button("Set Power"))
+	if (ImGui::Button("Add Power"))
 	{
 		launch_set_power_kernel(d_VF_0, d_VF_1, make_float3(cursor_pos[0], cursor_pos[1], cursor_pos[2]) * 0.5f + 0.5f,
 			cursor_radius, cursor_density);
