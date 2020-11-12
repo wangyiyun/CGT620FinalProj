@@ -11,6 +11,8 @@ using namespace std;
 #include <curand.h>
 #include <curand_kernel.h>
 
+#define PI 3.1415926
+
 cudaArray* d_transferFuncArray;
 cudaTextureObject_t transferTexObject; // Transfer texture Object
 
@@ -212,6 +214,155 @@ extern "C" void launch_init_VF_kernel(float4* VF)
 	cudaThreadSynchronize();
 }
 
+__global__ void clear_velocity(float4* VF_0, float4* VF_1)
+{
+	unsigned int x = blockIdx.x * blockDim.x + threadIdx.x;
+	unsigned int y = blockIdx.y * blockDim.y + threadIdx.y;
+	unsigned int z = blockIdx.z * blockDim.z + threadIdx.z;
+
+	if (x >= c_VF_data_scale || y >= c_VF_data_scale || z >= c_VF_data_scale) return;
+
+	unsigned int index = Index_xyz(x, y, z, c_VF_data_scale);
+
+	VF_0[index].x = 0.0f;
+	VF_0[index].y = 0.0f;
+	VF_0[index].z = 0.0f;
+
+	VF_1[index].x = 0.0f;
+	VF_1[index].y = 0.0f;
+	VF_1[index].z = 0.0f;
+}
+
+extern "C" void launch_clear_velocity_kernel(float4* VF_0, float4* VF_1)
+{
+	dim3 block(8, 8, 8);
+	dim3 grid(h_VF_data_scale / block.x, h_VF_data_scale / block.y, h_VF_data_scale / block.z);
+
+	clear_velocity << <grid, block >> > (VF_0, VF_1);
+
+	checkCudaError("Clear velocity kernel failed!");
+
+	cudaThreadSynchronize();
+}
+
+__global__ void clear_power(float4* VF_0, float4* VF_1)
+{
+	unsigned int x = blockIdx.x * blockDim.x + threadIdx.x;
+	unsigned int y = blockIdx.y * blockDim.y + threadIdx.y;
+	unsigned int z = blockIdx.z * blockDim.z + threadIdx.z;
+
+	if (x >= c_VF_data_scale || y >= c_VF_data_scale || z >= c_VF_data_scale) return;
+
+	unsigned int index = Index_xyz(x, y, z, c_VF_data_scale);
+
+	VF_0[index].w = 0.0f;
+	VF_1[index].w = 0.0f;
+}
+
+extern "C" void launch_clear_power_kernel(float4* VF_0, float4* VF_1)
+{
+	dim3 block(8, 8, 8);
+	dim3 grid(h_VF_data_scale / block.x, h_VF_data_scale / block.y, h_VF_data_scale / block.z);
+
+	clear_power << <grid, block >> > (VF_0, VF_1);
+
+	checkCudaError("Clear power kernel failed!");
+
+	cudaThreadSynchronize();
+}
+
+__global__ void set_velocity(float4* VF_0, float4* VF_1,
+	float3 pos, float divergence, float3 curl, float radious)
+{
+	unsigned int x = blockIdx.x * blockDim.x + threadIdx.x;
+	unsigned int y = blockIdx.y * blockDim.y + threadIdx.y;
+	unsigned int z = blockIdx.z * blockDim.z + threadIdx.z;
+
+	if (x >= c_VF_data_scale || y >= c_VF_data_scale || z >= c_VF_data_scale) return;
+
+	unsigned int index = Index_xyz(x, y, z, c_VF_data_scale);
+
+	// (0, 1)
+	float u = (float)x / c_VF_data_scale;
+	float v = (float)y / c_VF_data_scale;
+	float w = (float)z / c_VF_data_scale;
+
+	float3 uvw = make_float3(u, v, w);
+	float3 p = uvw - pos;
+
+	if (length(p) < radious)
+	{
+		// divergence
+		float3 div = (uvw - pos) * divergence * 0.05f;
+		VF_0[index].x += div.x;
+		VF_0[index].y += div.y;
+		VF_0[index].z += div.z;
+		VF_1[index].x += div.x;
+		VF_1[index].y += div.y;
+		VF_1[index].z += div.z;
+
+		// curl
+		float3 c = cross(p, curl);
+		VF_0[index].x += c.x * 0.05f;
+		VF_0[index].y += c.y * 0.05f;
+		VF_0[index].z += c.z * 0.05f;
+		VF_1[index].x += c.x * 0.05f;
+		VF_1[index].y += c.y * 0.05f;
+		VF_1[index].z += c.z * 0.05f;
+	}
+}
+
+extern "C" void launch_set_velocity_kernel(float4* VF_0, float4* VF_1,
+	float3 pos, float divergence, float3 curl, float radious)
+{
+	dim3 block(8, 8, 8);
+	dim3 grid(h_VF_data_scale / block.x, h_VF_data_scale / block.y, h_VF_data_scale / block.z);
+
+	set_velocity << <grid, block >> > (VF_0, VF_1, pos, divergence, curl, radious);
+
+	checkCudaError("Set velocity kernel failed!");
+
+	cudaThreadSynchronize();
+}
+
+__global__ void set_power(float4* VF_0, float4* VF_1,
+	float3 pos, float radious, float density)
+{
+	unsigned int x = blockIdx.x * blockDim.x + threadIdx.x;
+	unsigned int y = blockIdx.y * blockDim.y + threadIdx.y;
+	unsigned int z = blockIdx.z * blockDim.z + threadIdx.z;
+
+	if (x >= c_VF_data_scale || y >= c_VF_data_scale || z >= c_VF_data_scale) return;
+
+	unsigned int index = Index_xyz(x, y, z, c_VF_data_scale);
+
+	// (0, 1)
+	float u = (float)x / c_VF_data_scale;
+	float v = (float)y / c_VF_data_scale;
+	float w = (float)z / c_VF_data_scale;
+
+	float3 uvw = make_float3(u, v, w);
+
+	if (length(uvw - pos) < radious)
+	{
+		VF_0[index].w += density;
+		VF_1[index].w += density;
+	}
+}
+
+extern "C" void launch_set_power_kernel(float4* VF_0, float4* VF_1,
+	float3 pos, float radious, float density)
+{
+	dim3 block(8, 8, 8);
+	dim3 grid(h_VF_data_scale / block.x, h_VF_data_scale / block.y, h_VF_data_scale / block.z);
+
+	set_power << <grid, block >> > (VF_0, VF_1, pos, radious, density);
+
+	checkCudaError("Gradient kernel failed!");
+
+	cudaThreadSynchronize();
+}
+
 __global__ void calculte_gradient(float4* VF, float3* gradient)
 {
 	unsigned int x = blockIdx.x * blockDim.x + threadIdx.x;
@@ -276,7 +427,7 @@ extern "C" void launch_divergence_kernel(float3* gradient, float* divergence)
 	cudaThreadSynchronize();
 }
 
-__global__ void diffusion(float4* pre_VF, float4* current_VF, float* divergence)
+__global__ void diffusion(float4* input_VF, float4* output_VF, float* divergence)
 {
 	unsigned int x = blockIdx.x * blockDim.x + threadIdx.x;
 	unsigned int y = blockIdx.y * blockDim.y + threadIdx.y;
@@ -287,30 +438,30 @@ __global__ void diffusion(float4* pre_VF, float4* current_VF, float* divergence)
 	unsigned int index = Index_xyz(x, y, z, c_VF_data_scale);
 
 	// velocity
-	current_VF[index].x = pre_VF[index].x;
-	current_VF[index].y = pre_VF[index].y;
-	current_VF[index].z = pre_VF[index].z;
+	output_VF[index].x = input_VF[index].x;
+	output_VF[index].y = input_VF[index].y;
+	output_VF[index].z = input_VF[index].z;
 	
 	float dt = 0.5f;
 
 	// power
-	current_VF[index].w = pre_VF[index].w + divergence[index]* dt;
-	//current_VF[index].w = pre_VF[index].w;
+	output_VF[index].w = input_VF[index].w + divergence[index]* dt;
+	//output_VF[index].w = input_VF[index].w;
 }
 
-extern "C" void launch_diffusion_kernel(float4* pre_VF, float4* current_VF, float* divergence)
+extern "C" void launch_diffusion_kernel(float4* input_VF, float4* output_VF, float* divergence)
 {
 	dim3 block(8, 8, 8);
 	dim3 grid(h_VF_data_scale / block.x, h_VF_data_scale / block.y, h_VF_data_scale / block.z);
 
-	diffusion << <grid, block >> > (pre_VF, current_VF, divergence);
+	diffusion << <grid, block >> > (input_VF, output_VF, divergence);
 
 	checkCudaError("Diffusion kernel failed!");
 
 	cudaThreadSynchronize();
 }
 
-__global__ void advect(float4* pre_VF, float4* current_VF)
+__global__ void advect(float4* input_VF, float4* output_VF)
 {
 	unsigned int x = blockIdx.x * blockDim.x + threadIdx.x;
 	unsigned int y = blockIdx.y * blockDim.y + threadIdx.y;
@@ -324,18 +475,18 @@ __global__ void advect(float4* pre_VF, float4* current_VF)
 
 	unsigned int x0, y0, z0;
 	// at least move one step when dt is too small
-	if (current_VF[index].x < 0) x0 = ceil(x - current_VF[index].x * dt);
-	else x0 = floor(x - current_VF[index].x * dt);
-	if (current_VF[index].y < 0) y0 = ceil(y - current_VF[index].y * dt);
-	else y0 = floor(y - current_VF[index].y * dt);
-	if (current_VF[index].z < 0) z0 = ceil(z - current_VF[index].z * dt);
-	else z0 = floor(z - current_VF[index].z * dt);
+	if (output_VF[index].x < 0) x0 = ceil(x - output_VF[index].x * dt);
+	else x0 = floor(x - output_VF[index].x * dt);
+	if (output_VF[index].y < 0) y0 = ceil(y - output_VF[index].y * dt);
+	else y0 = floor(y - output_VF[index].y * dt);
+	if (output_VF[index].z < 0) z0 = ceil(z - output_VF[index].z * dt);
+	else z0 = floor(z - output_VF[index].z * dt);
 
 	// power
-	current_VF[index].w = current_VF[index].w*0.5f + pre_VF[Index_xyz(x0, y0, z0, c_VF_data_scale)].w*0.5f;
+	output_VF[index].w = output_VF[index].w*0.5f + input_VF[Index_xyz(x0, y0, z0, c_VF_data_scale)].w*0.5f;
 }
 
-__global__ void swap(float4* pre_VF, float4* current_VF)
+__global__ void swap(float4* input_VF, float4* output_VF)
 {
 	unsigned int x = blockIdx.x * blockDim.x + threadIdx.x;
 	unsigned int y = blockIdx.y * blockDim.y + threadIdx.y;
@@ -346,21 +497,21 @@ __global__ void swap(float4* pre_VF, float4* current_VF)
 	unsigned int index = Index_xyz(x, y, z, c_VF_data_scale);
 
 	// power
-	current_VF[index].w = pre_VF[index].w;
+	output_VF[index].w = input_VF[index].w;
 }
 
-extern "C" void launch_advect_kernel(float4* pre_VF, float4* current_VF)
+extern "C" void launch_advect_kernel(float4* input_VF, float4* output_VF)
 {
 	dim3 block(8, 8, 8);
 	dim3 grid(h_VF_data_scale / block.x, h_VF_data_scale / block.y, h_VF_data_scale / block.z);
 
-	advect << <grid, block >> > (pre_VF, current_VF);
+	advect << <grid, block >> > (input_VF, output_VF);
 
 	checkCudaError("Advect kernel failed!");
 
 	cudaThreadSynchronize();
 
-	swap << <grid, block >> > (current_VF, pre_VF);
+	swap << <grid, block >> > (output_VF, input_VF);
 
 	checkCudaError("Swap kernel failed!");
 
@@ -431,7 +582,7 @@ __global__ void render(float4* VF, float3* gradient, float* divergence,
 		// diffusion
 		float4 diffusion_color = tex1D<float4>(transferTex, (abs(sample.w) - transferOffset) * transferScale);
 		//diffusion_color = make_float4(rePos, sample.w);
-		diffusion_color.w = sample.w * 0.1f;
+		diffusion_color.w = sample.w * density;
 
 		diffusion_sum.x +=  (1.0f - diffusion_sum.w) * diffusion_color.w * diffusion_color.x;
 		diffusion_sum.y +=  (1.0f - diffusion_sum.w) * diffusion_color.w * diffusion_color.y;

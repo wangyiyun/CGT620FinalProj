@@ -35,7 +35,7 @@ const unsigned int VF_data_scale = 400;
 const unsigned int VF_data_size = VF_data_scale * VF_data_scale * VF_data_scale;
 
 // VBO vector field preview
-const unsigned int vf_view_scale = 32;
+const unsigned int vf_view_scale = 24;
 const float vf_view_step = 0.5f / vf_view_scale;
 const unsigned int vf_view_size = vf_view_scale * vf_view_scale * vf_view_scale;
 
@@ -87,12 +87,16 @@ float invViewMatrix[12];
 // init
 extern "C" void launch_init_VF_kernel(float4* VF);
 extern "C" void createTransferTexture();
-
+// user input
+extern "C" void launch_set_velocity_kernel(float4* VF_0, float4* VF_1, float3 pos, float divergence, float3 curl, float radious);
+extern "C" void launch_set_power_kernel(float4* VF_0, float4* VF_1, float3 pos, float radious, float denstity);
+extern "C" void launch_clear_velocity_kernel(float4* VF_0, float4* VF_1);
+extern "C" void launch_clear_power_kernel(float4* VF_0, float4* VF_1);
 // calculate
 extern "C" void launch_gradient_kernel(float4* VF, float3* gradient);
 extern "C" void launch_divergence_kernel(float3* gradient, float* divergence);
-extern "C" void launch_diffusion_kernel(float4* pre_VF, float4* current_VF, float* divergence);
-extern "C" void launch_advect_kernel(float4* pre_VF, float4* current_VF);
+extern "C" void launch_diffusion_kernel(float4* input_VF, float4* output_VF, float* divergence);
+extern "C" void launch_advect_kernel(float4* input_VF, float4* output_VF);
 
 // display
 extern "C" void copyInvViewMatrix(float* invViewMatrix, size_t sizeofMatrix);
@@ -111,9 +115,15 @@ extern "C" void freeCudaTextureBuffers();
 
 // imgui
 // ray marching parameters
-float density = 0.04f;
+float density = 0.5f;
 float transferOffset = 0.0f;
 float transferScale = 1.0f;
+
+float cursor_pos[3] = { 0.0f };
+float cursor_divergence = 0.0f;
+float cursor_curl[3] = { 0.0f };
+float cursor_radius = 0.1f;
+float cursor_density = 0.5f;
 
 
 void resetCamera()
@@ -134,7 +144,32 @@ void draw_gui()
 
 	ImGui::PushItemWidth(240);
 
-	//ImGui::SliderFloat("Volume Density", &density, 0.0f, 0.2f);
+	ImGui::SliderFloat3("Cursor Pos", cursor_pos, -1.0f, 1.0f);
+	ImGui::SliderFloat("Cursor Divergence", &cursor_divergence, -2.0f, 2.0f);
+	ImGui::SliderFloat3("Cursor Curl", cursor_curl, -1.0f, 1.0f);
+	ImGui::SliderFloat("Cursor Radius", &cursor_radius, 0.0f, 1.0f);
+	if (ImGui::Button("Set Velocities"))
+	{
+		launch_set_velocity_kernel(d_VF_0, d_VF_1, make_float3(cursor_pos[0], cursor_pos[1], cursor_pos[2]) * 0.5f + 0.5f,
+			cursor_divergence, make_float3(cursor_curl[0], cursor_curl[1], cursor_curl[2]), cursor_radius);
+	}
+	ImGui::SameLine();
+	if (ImGui::Button("Clear Velocity"))
+	{
+		launch_clear_velocity_kernel(d_VF_0, d_VF_1);
+	}
+	if (ImGui::Button("Set Power"))
+	{
+		launch_set_power_kernel(d_VF_0, d_VF_1, make_float3(cursor_pos[0], cursor_pos[1], cursor_pos[2]) * 0.5f + 0.5f,
+			cursor_radius, cursor_density);
+	}
+	ImGui::SameLine();
+	if (ImGui::Button("Clear Power"))
+	{
+		launch_clear_power_kernel(d_VF_0, d_VF_1);
+	}
+
+	ImGui::SliderFloat("Volume Density", &density, 0.0f, 1.0f);
 	ImGui::SliderFloat("Volume Transfer Offset", &transferOffset, -1.0f, 1.0f);
 	ImGui::SliderFloat("Volume Transfer Scale", &transferScale, 0.0f, 2.0f);
 	ImGui::End();
@@ -306,6 +341,8 @@ void runCuda()
 {
 	if (useVF_0)	// (input) VF_0 -> (diffusion) VF_1 -> (advect)(swap) VF_0 -> (output) VF_1 
 	{
+		// update VF from user input
+
 		// calculate
 		launch_gradient_kernel(d_VF_0, d_gradient);
 		launch_divergence_kernel(d_gradient, d_divergence);
@@ -323,6 +360,8 @@ void runCuda()
 	}
 	else	// (input) VF_1 -> (diffusion) VF_0 -> (advect)(swap) VF_1 -> (output) VF_0 
 	{
+		// update VF from user input
+
 		// calculate
 		launch_gradient_kernel(d_VF_1, d_gradient);
 		launch_divergence_kernel(d_gradient, d_divergence);
@@ -430,8 +469,6 @@ void drawVertexField()
 
 	glLineWidth(1.5f);
 	glDrawArrays(GL_LINES, 0, vf_view_size *4);
-	//glPointSize(2.0f);
-	//glDrawArrays(GL_POINTS, 0, dataSize*4);
 
 	glDisableClientState(GL_VERTEX_ARRAY);
 
@@ -439,6 +476,16 @@ void drawVertexField()
 	glDisableVertexAttribArray(1);
 	glBindBuffer(GL_ARRAY_BUFFER, 0);
 	glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);	// in case for imgui's bug
+
+	// draw 3D cursor
+	glEnable(GL_POINT_SMOOTH);
+	glEnableClientState(GL_VERTEX_ARRAY);
+	glPointSize(20.0f);
+	glVertexPointer(3, GL_FLOAT, 0, cursor_pos);
+	glDrawArrays(GL_POINTS, 0, 1);
+	glDisableClientState(GL_VERTEX_ARRAY);
+
+	glUseProgram(0);
 }
 
 void idle()
