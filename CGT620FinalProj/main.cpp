@@ -31,11 +31,11 @@ float time;
 const unsigned int tex_width = 512;	// tex_width of the figure
 const unsigned int tex_height = 512;	// tex_height of the figure
 // Field data float4(Vx, Vy, Vz, P) velocity and pressure/power/energy
-const unsigned int VF_data_scale = 400;
+const unsigned int VF_data_scale = 300;
 const unsigned int VF_data_size = VF_data_scale * VF_data_scale * VF_data_scale;
 
 // VBO vector field preview
-const unsigned int vf_view_scale = 24;
+const unsigned int vf_view_scale = 36;
 const float vf_view_step = 0.5f / vf_view_scale;
 const unsigned int vf_view_size = vf_view_scale * vf_view_scale * vf_view_scale;
 
@@ -47,11 +47,9 @@ GLuint shader_program = -1;
 struct cudaGraphicsResource* cuda_vbo_resource;
 float3* cuda_vbo_result;
 
-//float4* h_user_VF_inout = new float4[VF_data_size];	// User input
 // two VF buffer for swap
 float4* d_VF_0;
 float4* d_VF_1;
-//float4* d_user_input_VF;
 bool useVF_0 = true;	// ping-pong buffer flag
 float3* d_gradient;
 float* d_divergence;
@@ -88,7 +86,7 @@ float invViewMatrix[12];
 extern "C" void launch_init_VF_kernel(float4* VF);
 extern "C" void createTransferTexture();
 // user input
-extern "C" void launch_set_velocity_kernel(float4* VF_0, float4* VF_1, float3 pos, float divergence, float3 curl, float radious);
+extern "C" void launch_set_velocity_kernel(float4* VF_0, float4* VF_1, float3 pos, float divergence, float3 curl, float3 wind, float radious);
 extern "C" void launch_set_power_kernel(float4* VF_0, float4* VF_1, float3 pos, float radious, float denstity);
 extern "C" void launch_clear_velocity_kernel(float4* VF_0, float4* VF_1);
 extern "C" void launch_clear_power_kernel(float4* VF_0, float4* VF_1);
@@ -122,6 +120,7 @@ float transferScale = 1.0f;
 float cursor_pos[3] = { 0.0f };
 float cursor_divergence = 0.0f;
 float cursor_curl[3] = { 0.0f };
+float cursor_wind[3] = { 0.0f };
 float cursor_radius = 0.1f;
 float cursor_density = 0.5f;
 
@@ -137,6 +136,7 @@ void draw_gui()
 	ImGui_ImplGlut_NewFrame();
 	//ImGui::ShowDemoWindow();
 	ImGui::Begin("Main control");
+	ImGui::Text("Application average %.3f ms/frame (%.1f FPS)", 1000.0f / ImGui::GetIO().Framerate, ImGui::GetIO().Framerate);
 	if (ImGui::Button("Reset Camera"))
 	{
 		resetCamera();
@@ -152,23 +152,29 @@ void draw_gui()
 		cursor_curl[0] = 0.0f;
 		cursor_curl[1] = 0.0f;
 		cursor_curl[2] = 0.0f;
+		cursor_wind[0] = 0.0f;
+		cursor_wind[1] = 0.0f;
+		cursor_wind[2] = 0.0f;
 		cursor_radius = 0.1f;
 	}
 	ImGui::SliderFloat3("Cursor Pos", cursor_pos, -1.0f, 1.0f);
 	ImGui::SliderFloat("Cursor Divergence", &cursor_divergence, -2.0f, 2.0f);
 	ImGui::SliderFloat3("Cursor Curl", cursor_curl, -1.0f, 1.0f);
+	ImGui::SliderFloat3("Cursor Wind", cursor_wind, -1.0f, 1.0f);
 	ImGui::SliderFloat("Cursor Radius", &cursor_radius, 0.0f, 1.0f);
-	ImGui::SliderFloat("Cursor Density", &cursor_density, 0.0f, 1.0f);
-	if (ImGui::Button("Add Velocities"))
+	if (ImGui::Button("Add Velocity"))
 	{
 		launch_set_velocity_kernel(d_VF_0, d_VF_1, make_float3(cursor_pos[0], cursor_pos[1], cursor_pos[2]) * 0.5f + 0.5f,
-			cursor_divergence, make_float3(cursor_curl[0], cursor_curl[1], cursor_curl[2]), cursor_radius);
+			cursor_divergence, make_float3(cursor_curl[0], cursor_curl[1], cursor_curl[2]), 
+			make_float3(cursor_wind[0], cursor_wind[1], cursor_wind[2]),
+			cursor_radius);
 	}
 	ImGui::SameLine();
 	if (ImGui::Button("Clear Velocity"))
 	{
 		launch_clear_velocity_kernel(d_VF_0, d_VF_1);
 	}
+	ImGui::SliderFloat("Cursor Density", &cursor_density, 0.0f, 1.0f);
 	if (ImGui::Button("Add Power"))
 	{
 		launch_set_power_kernel(d_VF_0, d_VF_1, make_float3(cursor_pos[0], cursor_pos[1], cursor_pos[2]) * 0.5f + 0.5f,
@@ -478,8 +484,11 @@ void drawVertexField()
 	glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 6 * sizeof(GLfloat), 0);
 	glVertexAttribPointer(1, 3, GL_FLOAT, GL_FALSE, 6 * sizeof(GLfloat), (GLvoid*)(3 * sizeof(GLfloat)));
 
+	glPointSize(0.1f);
+	glDrawArrays(GL_POINTS, 0, vf_view_size * 4);
 	glLineWidth(1.5f);
 	glDrawArrays(GL_LINES, 0, vf_view_size *4);
+	
 
 	glDisableClientState(GL_VERTEX_ARRAY);
 

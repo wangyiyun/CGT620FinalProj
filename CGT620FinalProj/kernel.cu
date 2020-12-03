@@ -16,10 +16,10 @@ using namespace std;
 cudaArray* d_transferFuncArray;
 cudaTextureObject_t transferTexObject; // Transfer texture Object
 
-__constant__ unsigned int c_VF_data_scale = 400;
+__constant__ unsigned int c_VF_data_scale = 300;
 __constant__ unsigned int c_tex_width = 512;
 __constant__ unsigned int c_tex_height = 512;
-unsigned int h_VF_data_scale = 400;
+unsigned int h_VF_data_scale = 300;
 unsigned int h_tex_width = 512;
 unsigned int h_tex_height = 512;
 
@@ -272,7 +272,7 @@ extern "C" void launch_clear_power_kernel(float4* VF_0, float4* VF_1)
 }
 
 __global__ void set_velocity(float4* VF_0, float4* VF_1,
-	float3 pos, float divergence, float3 curl, float radious)
+	float3 pos, float divergence, float3 curl, float3 wind, float radious)
 {
 	unsigned int x = blockIdx.x * blockDim.x + threadIdx.x;
 	unsigned int y = blockIdx.y * blockDim.y + threadIdx.y;
@@ -302,23 +302,32 @@ __global__ void set_velocity(float4* VF_0, float4* VF_1,
 		VF_1[index].z += div.z;
 
 		// curl
-		float3 c = cross(p, curl);
-		VF_0[index].x += c.x * 0.05f;
-		VF_0[index].y += c.y * 0.05f;
-		VF_0[index].z += c.z * 0.05f;
-		VF_1[index].x += c.x * 0.05f;
-		VF_1[index].y += c.y * 0.05f;
-		VF_1[index].z += c.z * 0.05f;
+		float3 c = cross(p, curl) * 0.05f;
+		VF_0[index].x += c.x;
+		VF_0[index].y += c.y;
+		VF_0[index].z += c.z;
+		VF_1[index].x += c.x;
+		VF_1[index].y += c.y;
+		VF_1[index].z += c.z;
+
+		//wind
+		float3 uni_wind = wind * (radious - length(p)) * 0.2f;
+		VF_0[index].x += uni_wind.x;
+		VF_0[index].y += uni_wind.y;
+		VF_0[index].z += uni_wind.z;
+		VF_1[index].x += uni_wind.x;
+		VF_1[index].y += uni_wind.y;
+		VF_1[index].z += uni_wind.z;
 	}
 }
 
 extern "C" void launch_set_velocity_kernel(float4* VF_0, float4* VF_1,
-	float3 pos, float divergence, float3 curl, float radious)
+	float3 pos, float divergence, float3 curl, float3 wind, float radious)
 {
 	dim3 block(8, 8, 8);
 	dim3 grid(h_VF_data_scale / block.x, h_VF_data_scale / block.y, h_VF_data_scale / block.z);
 
-	set_velocity << <grid, block >> > (VF_0, VF_1, pos, divergence, curl, radious);
+	set_velocity << <grid, block >> > (VF_0, VF_1, pos, divergence, curl, wind, radious);
 
 	checkCudaError("Set velocity kernel failed!");
 
@@ -680,7 +689,7 @@ __global__ void sampling_VF(float3* cuda_vbo_result, float4* VF, unsigned int vf
 	// fill VBO
 	cuda_vbo_result[4 * vbo_index] = make_float3(u, v, w);// vert start cuda_vbo_result
 	cuda_vbo_result[4 * vbo_index + 1] = color;
-	cuda_vbo_result[4 * vbo_index + 2] = make_float3(u, v, w) + make_float3(0.0f, 0.01f, 0.0f) + velocity * 10.0f;	// vert end cuda_vbo_result
+	cuda_vbo_result[4 * vbo_index + 2] = make_float3(u, v, w) + velocity * 5.0f;	// vert end cuda_vbo_result
 	cuda_vbo_result[4 * vbo_index + 3] = color;
 }
 
